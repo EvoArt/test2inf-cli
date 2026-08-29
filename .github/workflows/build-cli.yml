@@ -1,0 +1,131 @@
+# Build the trimmed test2inf bundle on every platform we support.
+#
+# JuliaC has no cross-compilation: it builds for the host. So each platform's
+# bundle has to be built ON that platform, which is the whole reason this
+# workflow exists. Building locally can only ever produce one of them.
+#
+# On a tag (v*) the bundles are attached to a GitHub release, which is where
+# BadgerInfeR's install_test2inf() downloads them from.
+
+name: build-cli
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Don't let one platform's failure hide the others: a macOS-only problem
+      # should not stop us learning that Linux built fine.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x86_64
+            exe: test2inf.exe
+          - os: ubuntu-latest
+            label: linux-x86_64
+            exe: test2inf
+          - os: macos-latest      # ARM (M-series)
+            label: macos-arm64
+            exe: test2inf
+          - os: macos-13          # last Intel runner
+            label: macos-x86_64
+            exe: test2inf
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Julia 1.12
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: "1.12"
+
+      # build.sh is bash. Windows runners have Git Bash, so run every step
+      # under bash explicitly rather than relying on the default shell.
+      - name: Build bundle
+        shell: bash
+        run: |
+          cd test2inf-cli
+          ./build.sh
+
+      # build.sh already runs every model variant under both methods with
+      # JULIA_LOAD_CODEGEN_LIB=0 and fails if any of them does. This is a
+      # second, independent check that the artifact we are about to upload is
+      # the one that was tested, and that it runs from a clean directory.
+      - name: Smoke test the built bundle
+        shell: bash
+        run: |
+          cd test2inf-cli
+          test -x "dist/bin/${{ matrix.exe }}"
+          JULIA_LOAD_CODEGEN_LIB=0 "./dist/bin/${{ matrix.exe }}" --help > /dev/null
+          mkdir -p .ci_out
+          JULIA_LOAD_CODEGEN_LIB=0 "./dist/bin/${{ matrix.exe }}" \
+            --data testdata/sim.csv --out .ci_out --method map
+          test -s .ci_out/parameters.csv
+          echo "bundle runs on ${{ matrix.label }}"
+
+      - name: Run the Julia test suite
+        shell: bash
+        run: |
+          cd test2inf-cli
+          julia --project=. test/runtests.jl
+
+      # Ad-hoc signing so Gatekeeper does not quarantine a downloaded bundle.
+      # This is NOT notarisation: users may still need to clear the quarantine
+      # attribute once (the README says how). Real notarisation needs an Apple
+      # developer account, which this project does not have.
+      - name: Ad-hoc codesign (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cd test2inf-cli
+          find dist -type f \( -name "*.dylib" -o -perm -u+x \) -print0 |
+            xargs -0 -I{} codesign --force --sign - {} || true
+          codesign --force --sign - "dist/bin/${{ matrix.exe }}"
+          codesign --verify --verbose "dist/bin/${{ matrix.exe }}"
+
+      - name: Package
+        shell: bash
+        run: |
+          cd test2inf-cli
+          tar -czf "test2inf-${{ matrix.label }}.tar.gz" -C dist .
+          # A checksum the installer can verify, so a corrupted or substituted
+          # download fails loudly instead of producing wrong inference.
+          if command -v sha256sum > /dev/null; then
+            sha256sum "test2inf-${{ matrix.label }}.tar.gz" > "test2inf-${{ matrix.label }}.tar.gz.sha256"
+          else
+            shasum -a 256 "test2inf-${{ matrix.label }}.tar.gz" > "test2inf-${{ matrix.label }}.tar.gz.sha256"
+          fi
+          cat "test2inf-${{ matrix.label }}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test2inf-${{ matrix.label }}
+          path: |
+            test2inf-cli/test2inf-${{ matrix.label }}.tar.gz
+            test2inf-cli/test2inf-${{ matrix.label }}.tar.gz.sha256
+          retention-days: 30
+
+  release:
+    name: Attach bundles to the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true

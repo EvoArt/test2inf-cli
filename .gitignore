@@ -1,0 +1,22 @@
+# Build outputs
+build_cli/
+dist/
+juliac-env/
+*.dll.a
+test2inf-*.tar.gz
+test2inf-*.tar.gz.sha256
+
+# Working notes: a running log with superseded findings, kept locally rather
+# than published. DESIGN.md carries the conclusions that are still current.
+HANDOVER.md
+
+# Scratch
+_*.jl
+_*.log
+tune/*.log
+.verify/
+.ci_out/
+.metric_probe.csv
+
+# Real data exports: the badger cohort is not public.
+testdata/real*.csv

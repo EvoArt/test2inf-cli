@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# Build the trimmed test2inf binary and a slim, portable bundle.
+#
+# Requires Julia 1.12+ (trim does not exist before it) and a C toolchain. On
+# Windows juliaup's build provides MinGW; elsewhere the system compiler is used.
+#
+# Runs on Windows, Linux and macOS. There is NO cross-compilation: JuliaC builds
+# for the host, so each platform's bundle must be built on that platform. That is
+# what .github/workflows/build-cli.yml exists for.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$HERE"
+
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) PLATFORM=windows; EXE=test2inf.exe ;;
+  Darwin)               PLATFORM=macos;   EXE=test2inf ;;
+  *)                    PLATFORM=linux;   EXE=test2inf ;;
+esac
+echo "Platform: $PLATFORM"
+
+# Find a Julia that is actually 1.12+, rather than the first one on PATH: a
+# machine can easily have an older default (this one has 1.10 on PATH and
+# 1.12 under juliaup). Candidates in order: $JULIA, PATH, juliaup installs.
+julia_ok() {
+  [ -x "$1" ] || return 1
+  case "$("$1" --version 2>/dev/null)" in
+    *" 1.1"[2-9]*|*" 1."[2-9][0-9]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+if [ -z "${JULIA:-}" ]; then
+  for cand in "$(command -v julia || true)" \n              "$HOME"/.julia/juliaup/julia-1.1[2-9]*/bin/julia \n              "$HOME"/.julia/juliaup/julia-1.1[2-9]*/bin/julia.exe; do
+    if julia_ok "$cand"; then JULIA="$cand"; break; fi
+  done
+fi
+JULIA="${JULIA:-julia}"
+if [ ! -x "$JULIA" ]; then
+  echo "Julia 1.12+ not found (tried PATH and the juliaup default)" >&2
+  echo "Install with: juliaup add 1.12   (then set JULIA=...)" >&2
+  exit 1
+fi
+
+VER="$("$JULIA" --version)"
+echo "Using $VER"
+case "$VER" in
+  *" 1.1"[2-9]*|*" 1."[2-9][0-9]*) ;;
+  *) echo "Need Julia 1.12 or newer for --trim; got: $VER" >&2; exit 1 ;;
+esac
+
+# One-off: an environment holding JuliaC itself.
+if [ ! -d juliac-env ]; then
+  echo "Creating juliac-env..."
+  "$JULIA" -e 'using Pkg; Pkg.activate("juliac-env"); Pkg.add("JuliaC")'
+fi
+
+echo "Building (trim=safe)..."
+"$JULIA" --project=juliac-env -e 'using JuliaC; JuliaC.main(ARGS)' -- \
+  --output-exe test2inf \
+  --bundle build_cli \
+  --trim=safe \
+  --experimental \
+  ./Test2InfCLI
+
+# JuliaC bundles the whole Julia runtime regardless of what the trimmed code
+# reaches (JuliaC#129). Nothing here calls BLAS, LAPACK, GMP/MPFR or the C++
+# runtime, so those are dropped: 114 MB -> ~23 MB. Verified below.
+echo "Slimming bundle..."
+rm -rf dist
+cp -r build_cli dist
+# Match on the library STEM so one list covers .dll, .so and .dylib and the
+# versioned names each platform uses (libgmp.so.10, libgmp.10.dylib). Anything
+# the program actually calls must NOT be listed -- adding a dependency that
+# touches LinearAlgebra means BLAS has to come back, and the verification below
+# is what catches that.
+SLIM_STEMS="libopenblas64_ libopenblas libgfortran libquadmath
+            libgmp libgmpxx libmpfr libstdc++ libc++ libblastrampoline libgomp
+            libpcre2-16 libpcre2-32 libatomic"
+slim_dir() {
+  [ -d "$1" ] || return 0
+  ( cd "$1" || return 0
+    for stem in $SLIM_STEMS; do
+      rm -f "$stem".* "$stem"-*.* 2>/dev/null || true
+    done )
+}
+# Windows puts shared libraries in bin/, Linux and macOS in lib/.
+slim_dir dist/bin
+slim_dir dist/lib
+# Never ship a bundle that has not been run. A trimmed binary can link cleanly
+# and still die at runtime on a method that was trimmed away, so exercise every
+# code path with codegen disabled -- any JIT fallback then fails loudly.
+#
+# All five `sql e2e` variants run under both methods, not just three modes: the
+# analytic gradient now serves the inferred-Se/Sp models too, so its Se/Sp
+# reverse block is on the shipped path and has to be exercised here.
+echo "Verifying..."
+if [ -f testdata/sim.csv ]; then
+  fail=0
+  run_variant() {  # usage: run_variant <name> <cli args...>
+    name="$1"; shift
+    if JULIA_LOAD_CODEGEN_LIB=0 "./dist/bin/$EXE" \
+         --data testdata/sim.csv --out .verify "$@" >/dev/null 2>.verify.err; then
+      echo "  ok: $name"
+    else
+      echo "  FAILED: $name" >&2
+      sed 's/^/    /' .verify.err >&2
+      fail=1
+    fi
+  }
+  for method in map nuts; do
+    if [ "$method" = nuts ]; then
+      set -- --draws 50 --warmup 50
+    else
+      set --
+    fi
+    run_variant "$method: all tests (fixed)"    --method $method "$@"
+    run_variant "$method: all tests (inferred)" --method $method "$@" --infer-sesp
+    run_variant "$method: culture only (fixed)" --method $method "$@" --tests 3
+    run_variant "$method: no DPP (fixed)"       --method $method "$@" --tests 1,2,3,5,6
+    run_variant "$method: no DPP (inferred)"    --method $method "$@" --tests 1,2,3,5,6 --infer-sesp
+  done
+  # Both year processes must trim: rw1 is the default and iid is the fallback,
+  # and they take different branches in both the likelihood and the gradient.
+  run_variant "iid year process" --method map --year-process iid
+  run_variant "rw1 year process" --method map --year-process rw1
+  run_variant "iid + inferred"   --method map --year-process iid --infer-sesp
+  # HMC needs a --model whose parameter count matches the data. The shipped
+  # sets are tuned on the real cohort (58/70 par); testdata/sim.csv has 13/25,
+  # so the pre-tuned path cannot be exercised on it. Verify the explicit
+  # eps/L override instead, which is the same sampler minus the lookup.
+  run_variant "nuts + traj-draws"   --method nuts --draws 50 --warmup 50 --traj-draws 10
+  # A metric supplied as a FILE, which is how a user tunes for their own data
+  # without rebuilding -- the compiled-in metrics are only a default. Round
+  # trip it: export from a nuts run, then sample with it under hmc.
+  run_variant "nuts: --write-metric" --method nuts --draws 30 --warmup 30               --write-metric .metric_probe.csv
+  if [ -s .metric_probe.csv ]; then
+    run_variant "hmc: --metric from file" --method hmc --draws 30 --warmup 30                 --hmc-eps 0.2 --hmc-L 5 --metric .metric_probe.csv
+  else
+    echo "  FAILED: --write-metric produced no file" >&2
+    fail=1
+  fi
+  rm -f .metric_probe.csv
+  run_variant "hmc: explicit eps/L" --method hmc --draws 50 --warmup 50               --hmc-eps 0.3 --hmc-L 7 --model all_fixed || true
+  rm -rf .verify .verify.err
+  if [ "$fail" -ne 0 ]; then
+    echo "Bundle verification FAILED; not fit to ship." >&2
+    exit 1
+  fi
+  echo "All five variants ran under both methods."
+else
+  echo "WARNING: testdata/sim.csv missing; bundle NOT verified." >&2
+  exit 1
+fi
+
+echo
+echo "exe:    $(du -h "dist/bin/$EXE" | cut -f1)"
+echo "bundle: $(du -sh dist | cut -f1)"
+echo "Distribute the whole dist/ directory."
