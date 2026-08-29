@@ -52,9 +52,7 @@ jobs:
       # under bash explicitly rather than relying on the default shell.
       - name: Build bundle
         shell: bash
-        run: |
-          cd test2inf-cli
-          ./build.sh
+        run: ./build.sh
 
       # build.sh already runs every model variant under both methods with
       # JULIA_LOAD_CODEGEN_LIB=0 and fails if any of them does. This is a
@@ -63,7 +61,6 @@ jobs:
       - name: Smoke test the built bundle
         shell: bash
         run: |
-          cd test2inf-cli
           test -x "dist/bin/${{ matrix.exe }}"
           JULIA_LOAD_CODEGEN_LIB=0 "./dist/bin/${{ matrix.exe }}" --help > /dev/null
           mkdir -p .ci_out
@@ -74,9 +71,7 @@ jobs:
 
       - name: Run the Julia test suite
         shell: bash
-        run: |
-          cd test2inf-cli
-          julia --project=. test/runtests.jl
+        run: julia --project=. test/runtests.jl
 
       # Ad-hoc signing so Gatekeeper does not quarantine a downloaded bundle.
       # This is NOT notarisation: users may still need to clear the quarantine
@@ -85,7 +80,6 @@ jobs:
       - name: Ad-hoc codesign (macOS)
         if: runner.os == 'macOS'
         run: |
-          cd test2inf-cli
           find dist -type f \( -name "*.dylib" -o -perm -u+x \) -print0 |
             xargs -0 -I{} codesign --force --sign - {} || true
           codesign --force --sign - "dist/bin/${{ matrix.exe }}"
@@ -94,7 +88,6 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          cd test2inf-cli
           tar -czf "test2inf-${{ matrix.label }}.tar.gz" -C dist .
           # A checksum the installer can verify, so a corrupted or substituted
           # download fails loudly instead of producing wrong inference.
@@ -109,8 +102,8 @@ jobs:
         with:
           name: test2inf-${{ matrix.label }}
           path: |
-            test2inf-cli/test2inf-${{ matrix.label }}.tar.gz
-            test2inf-cli/test2inf-${{ matrix.label }}.tar.gz.sha256
+            test2inf-${{ matrix.label }}.tar.gz
+            test2inf-${{ matrix.label }}.tar.gz.sha256
           retention-days: 30
 
   release:

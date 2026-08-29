@@ -57,12 +57,11 @@ OPTIONS:
   --out <dir>          Output directory                    (default: .)
   --seasons <int>      Timesteps per year                  (default: 4)
   --tests <list>       Comma-separated assay indices 1-6   (default: all)
-  --year-process <p>   rw1 | iid                            (default: rw1)
-                       rw1 is test2infeR's default and what every sql-e2e fit
-                       used, so it is the default here too. It also changes the
-                       sigma_g prior (Normal+(0,0.05) vs iid's Normal+(0,0.30)).
+  --year-process <p>   rw1 | iid                           (default: rw1)
+                       Different models, not tuning options: rw1 also uses a
+                       tighter sigma_g prior, N+(0,0.05) vs N+(0,0.30).
   --infer-sesp         Estimate Se/Sp instead of fixing them at Table 1
-                       (not identifiable with --tests 3 alone: see --help notes)
+                       (not identifiable with --tests 3 alone)
   --no-penalty         Drop the Se+Sp>1 identifiability penalty
   --repeat <mode>      stack | pool | last                 (default: stack)
   --draws <int>        NUTS post-warmup draws              (default: 1000)
@@ -70,30 +69,24 @@ OPTIONS:
   --accept <float>     NUTS target acceptance              (default: 0.8)
   --seed <int>         RNG seed                            (default: 1)
   --maxiter <int>      L-BFGS iteration cap                (default: 1000)
-  --model <name>       Pre-tuned HMC parameters to use, one of:
-                         all_fixed  all_inferred  culture_only_fixed
-                         no_dpp_fixed  no_dpp_inferred
-                       Sets the dense mass matrix, step size and L. NOTE these
-                       were tuned on the sql-e2e cohort and are applied on your
-                       word: only the parameter COUNT is checked, so using them
-                       on other data samples badly rather than failing. Retune
-                       with tune/tune_hmc.jl if your data differs.
+  --model <name>       Pre-tuned HMC step size, trajectory length and dense
+                       mass matrix. One of: all_fixed, all_inferred,
+                       culture_only_fixed, no_dpp_fixed, no_dpp_inferred.
+                       Tuned for the badger cohort; only the parameter count is
+                       checked, so other data samples badly rather than
+                       failing. Retune with tune/tune_hmc.jl, or use --metric.
   --hmc-eps <float>    Override the pre-tuned step size
   --hmc-L <int>        Override the pre-tuned trajectory length
   --metric <path>      Inverse mass matrix from a headerless CSV, overriding
-                       any --model metric. n rows of n values, or a single
-                       row/column of n values for a diagonal metric. Lets a
-                       metric tuned for YOUR data be used without rebuilding
-                       the binary; --model's compiled-in metrics are only a
-                       convenience default for the badger cohort.
+                       --model. n rows of n values, or one row/column of n
+                       values for a diagonal metric.
   --write-metric <path>
-                       After sampling, write the metric that was used to this
-                       path, so a tuned run can be replayed with --metric.
-  --traj-draws <int>   Write per-draw prevalence and infection times, using an
-                       evenly spaced subsample of this many draws (default: 0,
-                       off). nuts/hmc only. Needed by the sql-e2e trajectory
-                       outputs; costs one forward-backward pass per badger per
-                       draw kept.
+                       Write the metric used, for replay with --metric. Works
+                       under --method nuts, which is how to tune for own data.
+  --traj-draws <int>   Per-draw prevalence and infection times, from an evenly
+                       spaced subsample of this many draws (default: 0, off).
+                       nuts/hmc only. Costs one forward-backward pass per
+                       badger per draw kept.
   --help               Show this message
 
 OUTPUTS (in --out):
