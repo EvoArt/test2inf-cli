@@ -96,6 +96,19 @@ slim_dir dist/lib
 echo "Verifying..."
 if [ -f testdata/sim.csv ]; then
   fail=0
+  # A bundle that cannot start at all fails every variant identically with no
+  # stderr, which is indistinguishable from a model bug in the output above.
+  # Check that first, and say what is actually in the bundle if it happens.
+  if ! JULIA_LOAD_CODEGEN_LIB=0 "./dist/bin/$EXE" --help >/dev/null 2>.verify.err; then
+    echo "  FAILED: the binary will not start at all (exit $?)." >&2
+    echo "  --- stderr ---" >&2
+    sed 's/^/    /' .verify.err >&2
+    echo "  --- dist/bin ---" >&2
+    ls -la dist/bin | sed 's/^/    /' >&2
+    [ -d dist/lib ] && { echo "  --- dist/lib ---" >&2; ls -la dist/lib | sed 's/^/    /' >&2; }
+    rm -f .verify.err
+    exit 1
+  fi
   run_variant() {  # usage: run_variant <name> <cli args...>
     name="$1"; shift
     if JULIA_LOAD_CODEGEN_LIB=0 "./dist/bin/$EXE" \
