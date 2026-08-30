@@ -65,27 +65,30 @@ echo "Building (trim=safe)..."
 # JuliaC bundles the whole Julia runtime regardless of what the trimmed code
 # reaches (JuliaC#129). Nothing here calls BLAS, LAPACK, GMP/MPFR or the C++
 # runtime, so those are dropped: 114 MB -> ~23 MB. Verified below.
-echo "Slimming bundle..."
+# NO slimming. The bundle ships whatever JuliaC produced.
+#
+# Two attempts at trimming it failed, and both failures were invisible on a
+# developer machine:
+#
+#   1. A hand-maintained "these are unused" list deleted libgmp, libmpfr,
+#      libblastrampoline, libgfortran and libopenblas64_ -- all of which the
+#      executable actually IMPORTS, because Julia links them into every build
+#      whether or not the program calls BLAS.
+#   2. Keeping exactly the executable's imports deleted their TRANSITIVE
+#      dependencies (libgcc_s_seh, libwinpthread, libuv, libz, ...).
+#
+# Both produced a bundle that ran fine locally -- the loader found the missing
+# DLLs on PATH, because a developer machine has Julia installed -- and failed
+# on a clean CI runner with exit 127 and no output whatsoever. The 23 MB figure
+# quoted in the README was never a self-contained bundle.
+#
+# A correct slimmer would need the full transitive closure of the import graph.
+# That is a real tool, not a shell loop, and until someone writes one a
+# ~120 MB bundle that works everywhere beats a 23 MB one that works only where
+# Julia is already installed.
+echo "Packaging bundle..."
 rm -rf dist
 cp -r build_cli dist
-# Match on the library STEM so one list covers .dll, .so and .dylib and the
-# versioned names each platform uses (libgmp.so.10, libgmp.10.dylib). Anything
-# the program actually calls must NOT be listed -- adding a dependency that
-# touches LinearAlgebra means BLAS has to come back, and the verification below
-# is what catches that.
-SLIM_STEMS="libopenblas64_ libopenblas libgfortran libquadmath
-            libgmp libgmpxx libmpfr libstdc++ libc++ libblastrampoline libgomp
-            libpcre2-16 libpcre2-32 libatomic"
-slim_dir() {
-  [ -d "$1" ] || return 0
-  ( cd "$1" || return 0
-    for stem in $SLIM_STEMS; do
-      rm -f "$stem".* "$stem"-*.* 2>/dev/null || true
-    done )
-}
-# Windows puts shared libraries in bin/, Linux and macOS in lib/.
-slim_dir dist/bin
-slim_dir dist/lib
 # Never ship a bundle that has not been run. A trimmed binary can link cleanly
 # and still die at runtime on a method that was trimmed away, so exercise every
 # code path with codegen disabled -- any JIT fallback then fails loudly.

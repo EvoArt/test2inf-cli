@@ -132,9 +132,15 @@ declare success otherwise.
   `AbstractString`.
 - **`ntuple(f, N)` with `N` a type parameter stops unrolling above 8** and
   allocates — chunk 12 cost 86 ms against 138 µs. Always `ntuple(f, Val(N))`.
-- **Bundle slimming is specific to what the program calls.** Adding a
-  dependency that touches `LinearAlgebra` means BLAS must go back in. The
-  verification step is what catches that.
+- **Do not slim the bundle by guessing.** Two attempts failed identically:
+  a hand-maintained "unused" list, and keeping exactly the executable's
+  imports. The first deleted libraries Julia links into every build
+  (libgmp, libmpfr, libblastrampoline, libgfortran, libopenblas64_); the
+  second deleted their transitive dependencies. Both ran fine locally --
+  the loader found the missing DLLs on PATH, because a developer machine
+  has Julia installed -- and failed on a clean CI runner with exit 127 and
+  no output at all. Correct slimming needs the full transitive closure of
+  the import graph, which is a real tool rather than a shell loop.
 
 ## No cross-compilation
 

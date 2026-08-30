@@ -1,7 +1,8 @@
 # test2inf
 
 Standalone badger diagnostic HMM inference. One binary, no Julia or R on the
-target machine. Executable 3.2 MB, bundle 23 MB.
+target machine. Executable 3.2 MB, bundle ~115 MB (the Julia runtime, shipped
+whole so the bundle is genuinely self-contained).
 
 Two-state absorbing HMM (uninfected → infected) over capture histories, six
 imperfect tests, seasonal hazard with a year effect, sensitivity and specificity
