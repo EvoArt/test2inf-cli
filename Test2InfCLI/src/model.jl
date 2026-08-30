@@ -22,12 +22,77 @@ const PENALTY_SCALE     = 0.02
 # neither sql-e2e script overrides it, so it is the default here too. The
 # tighter sigma prior is part of the process, not an independent knob: rw1
 # accumulates, so the same sigma would give far larger year effects.
-const PROC_IID = 0
-const PROC_RW1 = 1
-const SIGMA_G_PRIOR_SD_IID = 0.30
-const SIGMA_G_PRIOR_SD_RW1 = 0.05
-@inline sigma_prior_sd(proc::Int) = proc == PROC_RW1 ? SIGMA_G_PRIOR_SD_RW1 :
-                                                       SIGMA_G_PRIOR_SD_IID
+# The five processes test2infeR supports that have a closed-form adjoint here.
+# `ar1` is deliberately absent: it introduces a parameter (rho ~ Beta(5,2)),
+# which changes the parameter-vector length and layout and would invalidate
+# every pre-tuned metric. It errors clearly rather than being approximated.
+const PROC_IID    = 0
+const PROC_RW1    = 1
+const PROC_RW2    = 2
+const PROC_NONE   = 3
+const PROC_SHRUNK = 4
+
+const SIGMA_G_PRIOR_SD_IID    = 0.30
+const SIGMA_G_PRIOR_SD_RW1    = 0.05
+const SIGMA_G_PRIOR_SD_RW2    = 0.01
+const SIGMA_G_PRIOR_SD_SHRUNK = 0.10
+
+# The sigma prior is part of the process, not an independent knob: a process
+# that accumulates would give far larger year effects at the same sigma. These
+# match test2infeR's `sigma_prior`, including that :none falls through to the
+# 0.30 default there.
+@inline function sigma_prior_sd(proc::Int)
+    proc == PROC_RW1    && return SIGMA_G_PRIOR_SD_RW1
+    proc == PROC_RW2    && return SIGMA_G_PRIOR_SD_RW2
+    proc == PROC_SHRUNK && return SIGMA_G_PRIOR_SD_SHRUNK
+    return SIGMA_G_PRIOR_SD_IID          # iid and none
+end
+
+"""
+    build_gamma!(gamma, raw_at, sigma_g, proc, n_years)
+
+Year effects from the unconstrained `raw` vector, matching test2infeR's
+`build_gamma`:
+
+    none    gamma_y = 0
+    iid     gamma_y = sigma_g * raw_y
+    shrunk  gamma_y = sigma_g * raw_y            (differs from iid only in the
+                                                  sigma prior, 0.10 vs 0.30)
+    rw1     gamma_y = sigma_g * sum_{k<=y} raw_k
+    rw2     gamma_y = sigma_g * cumsum(cumsum(raw))_y
+
+`raw_at(y)` reads the y-th raw value, so this works for both `Float64` and the
+dual numbers the forward-mode reference uses.
+"""
+@inline function build_gamma!(gamma, raw_at::F, sigma_g, proc::Int,
+                              n_years::Int) where {F}
+    if proc == PROC_NONE
+        @inbounds for y in 1:n_years
+            gamma[y] = zero(sigma_g)
+        end
+    elseif proc == PROC_RW1
+        acc = zero(sigma_g)
+        @inbounds for y in 1:n_years
+            acc = acc + raw_at(y)
+            gamma[y] = sigma_g * acc
+        end
+    elseif proc == PROC_RW2
+        # cumsum of the cumsum: `acc` is the running sum of raw, `acc2` the
+        # running sum of THAT.
+        acc = zero(sigma_g)
+        acc2 = zero(sigma_g)
+        @inbounds for y in 1:n_years
+            acc = acc + raw_at(y)
+            acc2 = acc2 + acc
+            gamma[y] = sigma_g * acc2
+        end
+    else                                  # iid and shrunk
+        @inbounds for y in 1:n_years
+            gamma[y] = sigma_g * raw_at(y)
+        end
+    end
+    return gamma
+end
 
 @inline season_of(t::Int, S::Int) = (t - 1) % S + 1
 @inline year_of(t::Int, S::Int) = (t - 1) ÷ S + 1
@@ -200,21 +265,11 @@ function logposterior(theta::AbstractVector{T}, data::HMMData, layout::ParamLayo
     #   iid  gamma_y = sigma_g * raw_y
     #   rw1  gamma_y = sigma_g * sum(raw_1..raw_y)     (a random walk)
     gamma = Vector{T}(undef, n_years)
-    if layout.year_process == PROC_RW1
-        acc = zero(T)
-        @inbounds for y in 1:n_years
-            raw = theta[layout.i_gamma + y - 1]
-            lp = lp + normal_logpdf(raw, 0.0, 1.0)
-            acc = acc + raw
-            gamma[y] = sigma_g * acc
-        end
-    else
-        @inbounds for y in 1:n_years
-            raw = theta[layout.i_gamma + y - 1]
-            lp = lp + normal_logpdf(raw, 0.0, 1.0)
-            gamma[y] = sigma_g * raw
-        end
+    @inbounds for y in 1:n_years
+        lp = lp + normal_logpdf(theta[layout.i_gamma + y - 1], 0.0, 1.0)
     end
+    build_gamma!(gamma, y -> theta[layout.i_gamma + y - 1], sigma_g,
+                 layout.year_process, n_years)
 
     pi1_0 = theta[layout.i_pi1_0]
     pi1_mult = theta[layout.i_pi1_mult]
@@ -292,17 +347,8 @@ function extract_params(theta::Vector{Float64}, layout::ParamLayout)
     alpha = [theta[layout.i_alpha + s - 1] for s in 1:S]
     sigma_g = exp(theta[layout.i_logsigma])
     gamma = Vector{Float64}(undef, n_years)
-    if layout.year_process == PROC_RW1
-        acc = 0.0
-        for y in 1:n_years
-            acc += theta[layout.i_gamma + y - 1]
-            gamma[y] = sigma_g * acc
-        end
-    else
-        for y in 1:n_years
-            gamma[y] = sigma_g * theta[layout.i_gamma + y - 1]
-        end
-    end
+    build_gamma!(gamma, y -> theta[layout.i_gamma + y - 1], sigma_g,
+                 layout.year_process, n_years)
     pi1_0 = theta[layout.i_pi1_0]
     pi1_mult = theta[layout.i_pi1_mult]
     pi1_vec = [clamp_prob(logistic(pi1_0 + pi1_mult * gamma[y])) for y in 1:n_years]

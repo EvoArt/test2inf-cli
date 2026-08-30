@@ -463,6 +463,65 @@ const SPARSE = joinpath(@__DIR__, "..", "testdata", "sparse.csv")
         @test_throws ErrorException M.hmc(gradf!, th, pt.inv_mass, pt.eps, pt.L, 10, 10, 1)
     end
 
+    @testset "every year process agrees with forward-mode AD" begin
+        # The CLI supports five of test2infeR's six year processes; ar1 is
+        # excluded because it adds a rho parameter that would change the
+        # vector layout. Each process is a different gamma map and so a
+        # different adjoint, and rw2's in particular (a reverse cumsum of a
+        # reverse cumsum) is easy to get subtly wrong in a way that only shows
+        # up as a slightly wrong posterior.
+        for proc in (M.PROC_IID, M.PROC_RW1, M.PROC_RW2, M.PROC_NONE, M.PROC_SHRUNK)
+            for infer in (false, true), pen in (true, false)
+                lay = M.ParamLayout(data.S, data.n_years, infer, proc)
+                logp = th -> M.logposterior(th, data, lay, se_ab, sp_ab, pen)
+                for trial in 1:3
+                    th = M.initial_theta(lay) .+ 0.13 * (trial - 1) .+ 0.05
+                    ga = zeros(lay.n)
+                    la = M.logposterior_grad!(ga, th, data, lay, se_ab, sp_ab, pen)
+                    gf = zeros(lay.n)
+                    lf = infer ? M.gradient!(gf, logp, th, Val(25)) :
+                                 M.gradient!(gf, logp, th, Val(13))
+                    @test isapprox(la, lf; atol = 1e-8)
+                    @test maximum(abs.(ga .- gf)) < 1e-10
+                end
+            end
+        end
+    end
+
+    @testset "the year processes are genuinely different models" begin
+        # A wrong gamma map would still sample; it would just sample the wrong
+        # posterior. Pin the actual arithmetic rather than only the gradient.
+        lay_iid = M.ParamLayout(data.S, data.n_years, false, M.PROC_IID)
+        lay_rw1 = M.ParamLayout(data.S, data.n_years, false, M.PROC_RW1)
+        lay_rw2 = M.ParamLayout(data.S, data.n_years, false, M.PROC_RW2)
+        lay_non = M.ParamLayout(data.S, data.n_years, false, M.PROC_NONE)
+        lay_shr = M.ParamLayout(data.S, data.n_years, false, M.PROC_SHRUNK)
+        th = M.initial_theta(lay_rw1) .+ 0.07
+
+        P_iid = M.extract_params(th, lay_iid)
+        P_rw1 = M.extract_params(th, lay_rw1)
+        P_rw2 = M.extract_params(th, lay_rw2)
+        P_non = M.extract_params(th, lay_non)
+        P_shr = M.extract_params(th, lay_shr)
+
+        acc = 0.0; acc2 = 0.0
+        for y in 1:data.n_years
+            r = th[lay_rw1.i_gamma + y - 1]
+            acc += r; acc2 += acc
+            @test isapprox(P_iid.gamma[y], P_iid.sigma_g * r;    atol = 1e-12)
+            @test isapprox(P_rw1.gamma[y], P_rw1.sigma_g * acc;  atol = 1e-12)
+            @test isapprox(P_rw2.gamma[y], P_rw2.sigma_g * acc2; atol = 1e-12)
+            @test P_non.gamma[y] == 0.0
+        end
+        # shrunk differs from iid ONLY in the sigma prior, so the gamma map is
+        # identical while the log density is not.
+        @test P_shr.gamma == P_iid.gamma
+        @test M.sigma_prior_sd(M.PROC_SHRUNK) == 0.10
+        @test M.sigma_prior_sd(M.PROC_RW2) == 0.01
+        @test M.logposterior(th, data, lay_shr, se_ab, sp_ab, true) !=
+              M.logposterior(th, data, lay_iid, se_ab, sp_ab, true)
+    end
+
     @testset "rw1 and iid are different models" begin
         # Guards the class of bug that made every earlier benchmark invalid:
         # the CLI silently fitting iid while the package fitted rw1.

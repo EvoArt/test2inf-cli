@@ -78,22 +78,13 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
     end
     log_sigma = theta[layout.i_logsigma]
     sigma_g = exp(log_sigma)
-    rw1 = layout.year_process == PROC_RW1
+    proc = layout.year_process
     raw = Vector{Float64}(undef, n_years)
     gamma = Vector{Float64}(undef, n_years)
-    if rw1
-        acc = 0.0
-        @inbounds for y in 1:n_years
-            raw[y] = theta[layout.i_gamma + y - 1]
-            acc += raw[y]
-            gamma[y] = sigma_g * acc
-        end
-    else
-        @inbounds for y in 1:n_years
-            raw[y] = theta[layout.i_gamma + y - 1]
-            gamma[y] = sigma_g * raw[y]
-        end
+    @inbounds for y in 1:n_years
+        raw[y] = theta[layout.i_gamma + y - 1]
     end
+    build_gamma!(gamma, y -> raw[y], sigma_g, proc, n_years)
     pi1_0 = theta[layout.i_pi1_0]
     pi1_mult = theta[layout.i_pi1_mult]
 
@@ -401,19 +392,45 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
     #          d/dlog_sigma += sum_y gbar_y * gamma_y / sigma_g
     #        (gamma_y / sigma_g is that year's accumulated raw, so this is the
     #         same "gbar . dgamma/dlog_sigma" contraction as the iid case.)
-    if rw1
+    #   none    gamma_y = 0                       -> no raw or sigma partials
+    #   iid      gamma_y = sigma_g * raw_y
+    #   shrunk   same as iid (only the sigma prior differs)
+    #   rw1      gamma_y = sigma_g * sum_{k<=y} raw_k
+    #              raw_k feeds every gamma from y=k on, so its adjoint is a
+    #              REVERSE cumulative sum of the gamma adjoints.
+    #   rw2      gamma_y = sigma_g * sum_{j<=y} sum_{k<=j} raw_k, so raw_k
+    #              appears in gamma_y with weight (y - k + 1). Its adjoint is
+    #              therefore the reverse cumsum OF THE REVERSE CUMSUM: running
+    #              `suffix` backwards accumulates sum_{y>=k} gbar_y, and running
+    #              `suffix2` over that accumulates the weighted version.
+    #
+    # In every case dlogsigma contracts gbar against d(gamma)/d(log sigma),
+    # which is just gamma itself (gamma is linear in sigma_g), so the one
+    # expression covers all of them.
+    if proc == PROC_NONE
+        # gamma is identically zero: nothing flows back to raw or sigma_g.
+    elseif proc == PROC_RW1
         suffix = 0.0
         @inbounds for y in n_years:-1:1
             suffix += gbar_gamma[y]
             g[layout.i_gamma + y - 1] += suffix * sigma_g
         end
-        @inbounds for y in 1:n_years
-            dlogsigma += gbar_gamma[y] * gamma[y]
+    elseif proc == PROC_RW2
+        suffix = 0.0
+        suffix2 = 0.0
+        @inbounds for y in n_years:-1:1
+            suffix += gbar_gamma[y]
+            suffix2 += suffix
+            g[layout.i_gamma + y - 1] += suffix2 * sigma_g
         end
-    else
+    else                                   # iid and shrunk
         @inbounds for y in 1:n_years
             g[layout.i_gamma + y - 1] += gbar_gamma[y] * sigma_g
-            dlogsigma += gbar_gamma[y] * raw[y] * sigma_g
+        end
+    end
+    if proc != PROC_NONE
+        @inbounds for y in 1:n_years
+            dlogsigma += gbar_gamma[y] * gamma[y]
         end
     end
     g[layout.i_logsigma] += dlogsigma

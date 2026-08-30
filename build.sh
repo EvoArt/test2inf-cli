@@ -147,8 +147,9 @@ if [ -f testdata/sim.csv ]; then
   done
   # Both year processes must trim: rw1 is the default and iid is the fallback,
   # and they take different branches in both the likelihood and the gradient.
-  run_variant "iid year process" --method map --year-process iid
-  run_variant "rw1 year process" --method map --year-process rw1
+  for yp in iid rw1 rw2 none shrunk; do
+    run_variant "$yp year process" --method map --year-process "$yp"
+  done
   run_variant "iid + inferred"   --method map --year-process iid --infer-sesp
   # HMC needs a --model whose parameter count matches the data. The shipped
   # sets are tuned on the real cohort (58/70 par); testdata/sim.csv has 13/25,

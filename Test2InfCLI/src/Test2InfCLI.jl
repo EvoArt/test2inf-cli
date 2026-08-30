@@ -57,9 +57,11 @@ OPTIONS:
   --out <dir>          Output directory                    (default: .)
   --seasons <int>      Timesteps per year                  (default: 4)
   --tests <list>       Comma-separated assay indices 1-6   (default: all)
-  --year-process <p>   rw1 | iid                           (default: rw1)
-                       Different models, not tuning options: rw1 also uses a
-                       tighter sigma_g prior, N+(0,0.05) vs N+(0,0.30).
+  --year-process <p>   rw1 | iid | rw2 | none | shrunk      (default: rw1)
+                       Different models, not tuning options; each carries its
+                       own sigma_g prior (rw1 0.05, rw2 0.01, shrunk 0.10,
+                       iid/none 0.30). ar1 is not supported here -- it adds a
+                       rho parameter that changes the vector layout.
   --infer-sesp         Estimate Se/Sp instead of fixing them at Table 1
                        (not identifiable with --tests 3 alone)
   --no-penalty         Drop the Se+Sp>1 identifiability penalty
@@ -187,8 +189,18 @@ function parse_args(args::Vector{String})
                 year_process = PROC_RW1
             elseif yp == "iid"
                 year_process = PROC_IID
+            elseif yp == "rw2"
+                year_process = PROC_RW2
+            elseif yp == "none"
+                year_process = PROC_NONE
+            elseif yp == "shrunk"
+                year_process = PROC_SHRUNK
+            elseif yp == "ar1"
+                error("--year-process ar1 is not supported: it adds a rho " *
+                      "parameter, which changes the parameter vector layout. " *
+                      "Use test2infeR's JIT engine for ar1.")
             else
-                error("--year-process must be rw1 or iid")
+                error("--year-process must be one of: rw1, iid, rw2, none, shrunk")
             end
         elseif a == "--infer-sesp"
             infer_sesp = true
@@ -246,6 +258,15 @@ function parse_args(args::Vector{String})
                    repeat_captures, draws, warmup, accept, seed, maxiter,
                    year_process, traj_draws, metric, write_metric_path,
                    model, hmc_eps, hmc_L)
+end
+
+"Name of a year process, for reporting."
+function year_process_name(proc::Int)
+    proc == PROC_RW1    && return "rw1"
+    proc == PROC_RW2    && return "rw2"
+    proc == PROC_NONE   && return "none"
+    proc == PROC_SHRUNK && return "shrunk"
+    return "iid"
 end
 
 # --- initial values --------------------------------------------------------
@@ -808,7 +829,7 @@ function run(args::Vector{String})
             "  years: ", data.n_years,
             "  parameters: ", layout.n,
             "  year process: ",
-            layout.year_process == PROC_RW1 ? "rw1" : "iid")
+            year_process_name(layout.year_process))
 
     # Closures over the fixed data; concrete-typed so trim can trace them.
     logp = let data = data, layout = layout, se_ab = se_ab, sp_ab = sp_ab,
