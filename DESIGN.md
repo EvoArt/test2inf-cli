@@ -160,6 +160,22 @@ declare success otherwise.
   no output at all. Correct slimming needs the full transitive closure of
   the import graph, which is a real tool rather than a shell loop.
 
+## Build for a CPU baseline, not the build machine
+
+`build.sh` sets `JULIA_CPU_TARGET` to `generic` plus explicitly cloned
+`sandybridge`, `haswell` and `skylake-avx512` variants. Without it Julia targets
+the build host's own microarchitecture and bakes it into the image.
+
+This was not hypothetical: the v0.1.0 bundles were built on AMD Zen 3 CI runners
+and refused to start on an Intel Skylake laptop with
+
+    ERROR: Unable to find compatible target in cached code image.
+    Target 0 (znver3): Rejecting this target due to use of runtime-disabled features
+
+The download, the checksum and the unpack all succeeded; the binary simply would
+not run, on a machine with no way to diagnose why. The cost of fixing it is
+executable size — 3.2 MB to 7.8 MB — which is nothing against a ~115 MB bundle.
+
 ## No cross-compilation
 
 JuliaC builds for the host, so each platform's bundle must be built on that

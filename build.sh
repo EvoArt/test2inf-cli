@@ -54,6 +54,19 @@ if [ ! -d juliac-env ]; then
   "$JULIA" -e 'using Pkg; Pkg.activate("juliac-env"); Pkg.add("JuliaC")'
 fi
 
+# Build for a portable CPU baseline, not the build machine's own silicon.
+#
+# Without this, Julia targets the host microarchitecture and bakes it into the
+# image. A CI runner on AMD Zen 3 produced a bundle that refused to start on an
+# Intel Skylake laptop with "Rejecting this target due to use of
+# runtime-disabled features" -- a hard failure, on a machine with no way to
+# diagnose it. `generic` is the portable baseline; the extra targets let newer
+# CPUs still pick a faster path at load time, and `clone_all` makes each one a
+# complete copy rather than a partial specialisation.
+: "${JULIA_CPU_TARGET:=generic;sandybridge,clone_all;haswell,clone_all;skylake-avx512,clone_all}"
+export JULIA_CPU_TARGET
+echo "CPU target: $JULIA_CPU_TARGET"
+
 echo "Building (trim=safe)..."
 "$JULIA" --project=juliac-env -e 'using JuliaC; JuliaC.main(ARGS)' -- \
   --output-exe test2inf \
