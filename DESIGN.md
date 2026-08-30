@@ -9,17 +9,35 @@ timepoints, 51 years, 58 parameters (70 with Se/Sp inferred) — unless stated.
 The log-posterior's gradient is a hand-derived reverse sweep
 (`src/grad_analytic.jl`) rather than automatic differentiation.
 
+All figures below are at the FULL cohort, n = 3,224 badgers / 29,737 timesteps.
+Stating n is not pedantry: the AD gradient's cost is strongly n-dependent and in
+some configurations superlinear, so a gradient number without a cohort size
+cannot be compared to anything.
+
 | gradient | time | vs analytic |
 |---|---|---|
 | analytic reverse sweep | **1.63 ms** | 1.0x |
-| Turing/DynamicPPL + Mooncake | 6.02 ms | 3.7x |
+| Turing/DynamicPPL + Mooncake | 36.8 ms | ~23x |
 | Turing/DynamicPPL + ForwardDiff | 29.49 ms | 18.0x |
 
-Against a 1.37 ms primal, the analytic sweep costs 1.3x primal and Mooncake
-4.4x. Textbook reverse mode is 2–3x, so the gap is tape overhead rather than
-anything intrinsic: profiling puts ~33% of gradient self-time in `IdDict`
-get/setindex inside Mooncake's tape, GC-flagged, with four of the top six frames
-doing dynamic dispatch. The likelihood itself is 1.1% of self time.
+An earlier version of this file recorded Mooncake at 6.02 ms. That figure does
+NOT reproduce: re-measured on the same fixture in the same environment it is
+36.8 ms, and it should not be quoted. It is recorded here rather than quietly
+deleted because it was used to justify a "3.7x" claim that appears in commit
+messages and in the README.
+
+Mooncake's scaling is also configuration-dependent, which is the more important
+finding. Measured through `LogDensityFunction` on Julia 1.12.7 / Mooncake
+0.5.48 it is roughly linear in n (2.39 ms at 400 badgers to 36.8 ms at 3,224 —
+15.4x for 8.1x the data). Measured through `DynamicPPL.TestUtils.AD.run_ad` on
+Julia 1.10.9 a second session sees it go quadratic (4.37 ms to 506 ms — 116x for
+the same 8.1x), with 97.8% of time under Mooncake's `set_to_zero_internal!!`.
+Both are real; they are different configurations. `hmm_model` calls `seq_loglik`
+once per badger, so anything that re-traverses the accumulated tangent structure
+per call gives exactly n x O(n).
+
+The analytic sweep is O(n) by construction and costs 1.3x its own primal, which
+is why the advantage grows with cohort size rather than being a fixed multiple.
 
 Worth stating clearly, because it is the counter-intuitive part: **the PPL layer
 is not the cost.** DynamicPPL evaluates this model within 7% of a hand-written
