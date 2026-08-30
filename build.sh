@@ -99,16 +99,26 @@ if [ -f testdata/sim.csv ]; then
   # A bundle that cannot start at all fails every variant identically with no
   # stderr, which is indistinguishable from a model bug in the output above.
   # Check that first, and say what is actually in the bundle if it happens.
-  if ! JULIA_LOAD_CODEGEN_LIB=0 "./dist/bin/$EXE" --help >/dev/null 2>.verify.err; then
-    echo "  FAILED: the binary will not start at all (exit $?)." >&2
+  # `$?` inside the `if` body reports the LAST command, not the tested one, so
+  # capture the status explicitly. `set -e` is off for this call deliberately:
+  # a non-zero exit here is the thing being measured, not an error.
+  set +e
+  JULIA_LOAD_CODEGEN_LIB=0 "./dist/bin/$EXE" --help >.verify.out 2>.verify.err
+  start_status=$?
+  set -e
+  if [ "$start_status" -ne 0 ]; then
+    echo "  FAILED: the binary will not start at all (exit $start_status)." >&2
+    echo "  --- stdout ---" >&2
+    sed 's/^/    /' .verify.out >&2
     echo "  --- stderr ---" >&2
     sed 's/^/    /' .verify.err >&2
     echo "  --- dist/bin ---" >&2
     ls -la dist/bin | sed 's/^/    /' >&2
     [ -d dist/lib ] && { echo "  --- dist/lib ---" >&2; ls -la dist/lib | sed 's/^/    /' >&2; }
-    rm -f .verify.err
+    rm -f .verify.err .verify.out
     exit 1
   fi
+  rm -f .verify.out
   run_variant() {  # usage: run_variant <name> <cli args...>
     name="$1"; shift
     if JULIA_LOAD_CODEGEN_LIB=0 "./dist/bin/$EXE" \
