@@ -36,9 +36,12 @@ jobs:
           - os: macos-latest      # ARM (M-series)
             label: macos-arm64
             exe: test2inf
-          - os: macos-13          # last Intel runner
-            label: macos-x86_64
-            exe: test2inf
+          # macos-13 (the last Intel image) is omitted: it never started on
+          # this account across four runs, queueing indefinitely and blocking
+          # the release job, which needs every matrix leg to finish. GitHub is
+          # retiring that image. Intel Macs can build locally with build.sh,
+          # and BadgerInfeR's installer reports the missing platform clearly
+          # rather than downloading an ARM bundle.
 
     steps:
       - uses: actions/checkout@v4
