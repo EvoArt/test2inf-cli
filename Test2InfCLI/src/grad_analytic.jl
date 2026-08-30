@@ -1,6 +1,7 @@
 # Analytic gradient of the log posterior, covering all five `sql e2e` model
-# variants: any test mask (all / no-DPP / culture-only) with Se/Sp either fixed
-# at Table 1 or inferred, iid year process.
+# variants: any test mask (all / no-DPP / culture-only), Se/Sp either fixed at
+# Table 1 or inferred, and both year processes (rw1, the default, and iid --
+# see the reverse-cumsum adjoint at the end of this file).
 #
 # Why this exists: forward-mode AD costs one sweep per chunk of parameters, so
 # its gradient runs ~4.2x a single logp at 13 parameters and ~7.9x at 25. A
