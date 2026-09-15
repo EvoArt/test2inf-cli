@@ -65,7 +65,7 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
                             data::HMMData, layout::ParamLayout,
                             se_pr::AccuracyPriors, sp_pr::AccuracyPriors,
                             penalty::Bool,
-                            year_weight::Union{Nothing,Vector{Float64}} = nothing,
+                            year_weight::Vector{Float64} = EMPTY_YW,
                             jacobian::Bool = true)
     S = layout.S
     n_years = layout.n_years
@@ -436,7 +436,7 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
     #
     #   d/d(gamma[y])   = -(d/sd^2)   where d = gamma[y] - gamma[y-1]
     #   d/d(gamma[y-1]) = +(d/sd^2)
-    if year_weight !== nothing
+    if !isempty(year_weight)
         yw = year_weight
         @inbounds for y in 2:n_years
             n_eff = min(yw[y], yw[y - 1])
@@ -564,7 +564,7 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
         error("the short form is for the fixed-Se/Sp model; pass se_pr, sp_pr, penalty")
     se_pr, sp_pr = default_accuracy_priors(ACC_BETA)
     return logposterior_grad!(g, theta, data, layout, se_pr, sp_pr, penalty,
-                              nothing, true)
+                              EMPTY_YW, true)
 end
 
 # Back-compatible entry point for callers holding raw Beta (a,b) pairs.
@@ -576,5 +576,5 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
     se_pr = ntuple(k -> AccuracyPrior(ACC_BETA, se_ab[k][1], se_ab[k][2]), N_TESTS)
     sp_pr = ntuple(k -> AccuracyPrior(ACC_BETA, sp_ab[k][1], sp_ab[k][2]), N_TESTS)
     return logposterior_grad!(g, theta, data, layout, se_pr, sp_pr, penalty,
-                              nothing, true)
+                              EMPTY_YW, true)
 end

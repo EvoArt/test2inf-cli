@@ -533,7 +533,7 @@ const SPARSE = joinpath(@__DIR__, "..", "testdata", "sparse.csv")
         # right in both spaces.
         lay = M.ParamLayout(data.S, data.n_years, false, M.PROC_RW1C)
         th = M.initial_theta(lay) .+ 0.09
-        @test !isapprox(M.logposterior(th, data, lay, se_pr_b, sp_pr_b, true, nothing),
+        @test !isapprox(M.logposterior(th, data, lay, se_pr_b, sp_pr_b, true, M.EMPTY_YW),
                         M.logposterior(th, data, lay, se_pr_b, sp_pr_b, true, yw))
         for jac in (true, false)
             logp = t -> M.logposterior(t, data, lay, se_pr_b, sp_pr_b, true, yw, jac)
@@ -570,9 +570,9 @@ const SPARSE = joinpath(@__DIR__, "..", "testdata", "sparse.csv")
         lay = M.ParamLayout(data.S, data.n_years, true, M.PROC_RW1C)
         th = M.initial_theta(lay) .+ 0.05
         for jac in (true, false)
-            logp = t -> M.logposterior(t, data, lay, se_ln, sp_ln, true, nothing, jac)
+            logp = t -> M.logposterior(t, data, lay, se_ln, sp_ln, true, M.EMPTY_YW, jac)
             ga = zeros(lay.n)
-            la = M.logposterior_grad!(ga, th, data, lay, se_ln, sp_ln, true, nothing, jac)
+            la = M.logposterior_grad!(ga, th, data, lay, se_ln, sp_ln, true, M.EMPTY_YW, jac)
             gf = zeros(lay.n)
             lf = M.gradient!(gf, logp, th, Val(25))
             @test isapprox(la, lf; atol = 1e-8)
@@ -602,10 +602,10 @@ const SPARSE = joinpath(@__DIR__, "..", "testdata", "sparse.csv")
 
         se_ln, sp_ln = M.default_accuracy_priors(M.ACC_LOGITNORMAL)
         for jac in (true, false)
-            logp = t -> M.logposterior(t, data, lay_pin, se_ln, sp_ln, true, nothing, jac)
+            logp = t -> M.logposterior(t, data, lay_pin, se_ln, sp_ln, true, M.EMPTY_YW, jac)
             ga = zeros(lay_pin.n)
             la = M.logposterior_grad!(ga, th, data, lay_pin, se_ln, sp_ln, true,
-                                      nothing, jac)
+                                      M.EMPTY_YW, jac)
             gf = zeros(lay_pin.n)
             lf = M.gradient!(gf, logp, th, Val(25))
             @test isapprox(la, lf; atol = 1e-8)
@@ -629,8 +629,8 @@ const SPARSE = joinpath(@__DIR__, "..", "testdata", "sparse.csv")
         # available, and each must match the primal it is paired with.
         lay = M.ParamLayout(data.S, data.n_years, false, M.PROC_RW1C)
         th = M.initial_theta(lay) .+ 0.05
-        lp_j  = M.logposterior(th, data, lay, se_pr_b, sp_pr_b, true, nothing, true)
-        lp_nj = M.logposterior(th, data, lay, se_pr_b, sp_pr_b, true, nothing, false)
+        lp_j  = M.logposterior(th, data, lay, se_pr_b, sp_pr_b, true, M.EMPTY_YW, true)
+        lp_nj = M.logposterior(th, data, lay, se_pr_b, sp_pr_b, true, M.EMPTY_YW, false)
         # For fixed Se/Sp the only transformed parameter is sigma_g.
         @test lp_j - lp_nj ≈ th[lay.i_logsigma]
     end

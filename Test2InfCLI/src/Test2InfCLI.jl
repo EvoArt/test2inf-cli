@@ -282,11 +282,19 @@ function parse_args(args::Vector{String})
             spec = args[i]
             eq = findfirst('=', spec)
             eq === nothing && error("--pin-sp expects <index>=<value>, got \"$spec\"")
-            k = parse_int(spec[1:(eq - 1)], "pin-sp index")
-            (1 <= k <= N_TESTS) || error("--pin-sp index $k out of range 1..$N_TESTS")
-            v = parse_float(spec[(eq + 1):end], "pin-sp value")
-            (0.0 < v <= 1.0) || error("--pin-sp value must be in (0, 1], got $v")
-            sp_pin = ntuple(j -> j == k ? v : sp_pin[j], N_TESTS)
+            pk = parse_int(spec[1:(eq - 1)], "pin-sp index")
+            (1 <= pk <= N_TESTS) || error("--pin-sp index $pk out of range 1..$N_TESTS")
+            pv = parse_float(spec[(eq + 1):end], "pin-sp value")
+            (0.0 < pv <= 1.0) || error("--pin-sp value must be in (0, 1], got $pv")
+            # Built by explicit assignment, not `ntuple` with a closure: a
+            # closure capturing `pk`/`pv` boxes them (Core.Box), which erases
+            # the type and breaks trimming. It also boxed the `--tests` loop's
+            # own `k` by association, three verifier errors away from here.
+            sp_new = zeros(Float64, N_TESTS)
+            for j in 1:N_TESTS
+                sp_new[j] = j == pk ? pv : sp_pin[j]
+            end
+            sp_pin = NTuple{N_TESTS,Float64}(sp_new)
         elseif a == "--no-penalty"
             penalty = false
         elseif a == "--repeat"
@@ -652,7 +660,8 @@ Years are indexed exactly as the model indexes them, `year_of(t) = (t-1) div S
 prior by one year -- silently, since both produce a plausible-looking vector.
 """
 function year_weights(mat::Matrix{Float64}, test_mask::Vector{Bool},
-                      n_years::Int, S::Int)
+                      n_years::Int, S::Int, enabled::Bool = true)
+    enabled || return EMPTY_YW
     yw = zeros(Float64, n_years)
     test_cols = (size(mat, 2) - 5):size(mat, 2)
     @inbounds for r in axes(mat, 1)
@@ -690,7 +699,7 @@ the fallback the tests differentiate against; it is not on the sampling path.
                        data::HMMData, layout::ParamLayout,
                        se_pr::AccuracyPriors, sp_pr::AccuracyPriors,
                        penalty::Bool,
-                       year_weight::Union{Nothing,Vector{Float64}} = nothing,
+                       year_weight::Vector{Float64} = EMPTY_YW,
                        jacobian::Bool = true) where {L}
     return logposterior_grad!(g, x, data, layout, se_pr, sp_pr, penalty,
                               year_weight, jacobian)
@@ -718,7 +727,7 @@ function run_nuts(opts::Options, data::HMMData, layout::ParamLayout,
                   logp::L, negf!::F,
                   se_pr::AccuracyPriors, sp_pr::AccuracyPriors,
                   pen::Bool,
-                  yw::Union{Nothing,Vector{Float64}} = nothing) where {L,F}
+                  yw::Vector{Float64} = EMPTY_YW) where {L,F}
     # WITH the Jacobian: this is the unconstrained density the sampler must
     # explore. `negf!` below deliberately omits it, but that is only used to
     # find a starting point, never to sample.
@@ -770,7 +779,7 @@ function run_nutsthenhmc(opts::Options, data::HMMData, layout::ParamLayout,
                          logp::L, negf!::F,
                          se_pr::AccuracyPriors, sp_pr::AccuracyPriors,
                          pen::Bool,
-                         yw::Union{Nothing,Vector{Float64}} = nothing) where {L,F}
+                         yw::Vector{Float64} = EMPTY_YW) where {L,F}
     # WITH the Jacobian: both phases sample the unconstrained density.
     gradf! = let logp = logp, data = data, layout = layout,
                  se_pr = se_pr, sp_pr = sp_pr, pen = pen, yw = yw
@@ -893,7 +902,7 @@ function run_hmc(opts::Options, data::HMMData, layout::ParamLayout,
                  logp::L, negf!::F,
                  se_pr::AccuracyPriors, sp_pr::AccuracyPriors,
                  pen::Bool,
-                 yw::Union{Nothing,Vector{Float64}} = nothing) where {L,F}
+                 yw::Vector{Float64} = EMPTY_YW) where {L,F}
     # WITH the Jacobian, as for NUTS: the sampler explores the unconstrained
     # density, and omitting it would target a different posterior.
     gradf! = let logp = logp, data = data, layout = layout,
@@ -1046,8 +1055,10 @@ function run(args::Vector{String})
     layout = ParamLayout(data.S, data.n_years, opts.infer_sesp, opts.year_process,
                          opts.sp_pin)
     se_pr, sp_pr = default_accuracy_priors(opts.accuracy_prior)
-    yw = opts.year_weight ?
-         year_weights(mat, opts.tests, data.n_years, data.S) : nothing
+    # Concretely typed either way: `year_weights` returns an empty vector when
+    # the prior is off, so `yw` is always a Vector{Float64} and every call that
+    # takes it stays statically resolvable.
+    yw = year_weights(mat, opts.tests, data.n_years, data.S, opts.year_weight)
 
     # MAP on a prior whose density diverges at a probability boundary has no
     # interior maximum, so whatever the optimiser stops at is not a MAP

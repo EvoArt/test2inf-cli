@@ -38,6 +38,14 @@ const YEAR_LINK_FLOOR = 0.05
 "SD of the year-to-year increment prior, given the effective count for that link."
 @inline year_link_sd(n_eff::Float64) =
     YEAR_LINK_TAU * (n_eff / (1.0 + n_eff)) + YEAR_LINK_FLOOR
+
+# "No year weights" as an EMPTY VECTOR rather than `nothing`. A
+# `Union{Nothing,Vector{Float64}}` argument leaves the type unknown until run
+# time, and the trim verifier then cannot resolve any call that passes it --
+# which is four unresolved-call errors, one per method driver. An empty vector
+# keeps every signature concrete, and `isempty` reads the same as `=== nothing`
+# did at each use.
+const EMPTY_YW = Float64[]
 # Year-effect process. These MUST track test2infeR's build_gamma/sigma_prior:
 #   iid  gamma = sigma_g .* raw           sigma_g ~ Normal+(0, 0.30)
 #   rw1  gamma = sigma_g .* cumsum(raw)   sigma_g ~ Normal+(0, 0.05)
@@ -481,7 +489,7 @@ the dual-number gradient runs through the identical code path.
 function logposterior(theta::AbstractVector{T}, data::HMMData, layout::ParamLayout,
                       se_pr::AccuracyPriors, sp_pr::AccuracyPriors,
                       penalty::Bool,
-                      year_weight::Union{Nothing,Vector{Float64}} = nothing,
+                      year_weight::Vector{Float64} = EMPTY_YW,
                       jacobian::Bool = true) where {T}
     S = layout.S
     n_years = layout.n_years
@@ -517,7 +525,7 @@ function logposterior(theta::AbstractVector{T}, data::HMMData, layout::ParamLayo
 
     # Data-adaptive increment prior. `sd_y` depends only on the data, so this
     # contributes through gamma alone.
-    if year_weight !== nothing
+    if !isempty(year_weight)
         yw = year_weight
         @inbounds for y in 2:n_years
             n_eff = min(yw[y], yw[y - 1])
@@ -596,7 +604,7 @@ function logposterior(theta::AbstractVector{T}, data::HMMData, layout::ParamLayo
                       penalty::Bool) where {T}
     se_pr = ntuple(k -> AccuracyPrior(ACC_BETA, se_ab[k][1], se_ab[k][2]), N_TESTS)
     sp_pr = ntuple(k -> AccuracyPrior(ACC_BETA, sp_ab[k][1], sp_ab[k][2]), N_TESTS)
-    return logposterior(theta, data, layout, se_pr, sp_pr, penalty, nothing, true)
+    return logposterior(theta, data, layout, se_pr, sp_pr, penalty, EMPTY_YW, true)
 end
 
 # --- parameter extraction --------------------------------------------------
