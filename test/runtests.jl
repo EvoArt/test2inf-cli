@@ -17,6 +17,9 @@ const SPARSE = joinpath(@__DIR__, "..", "testdata", "sparse.csv")
     mat = M.read_matrix(DATA)
     data = M.build_data(mat, fill(true, 6), :stack, 4)
     se_ab, sp_ab = M.default_sesp_priors()
+    # The same Beta priors in the AccuracyPrior form the newer entry points
+    # take, so tests can exercise the full signature without restating them.
+    se_pr_b, sp_pr_b = M.default_accuracy_priors(M.ACC_BETA)
 
     @testset "data shape" begin
         @test data.n_ind > 0
@@ -488,6 +491,150 @@ const SPARSE = joinpath(@__DIR__, "..", "testdata", "sparse.csv")
         end
     end
 
+    @testset "rw1c centres the walk and identifies the level" begin
+        # Plain rw1 leaves the LEVEL of the year series free: adding a constant
+        # to every gamma is absorbed by nothing, so untested years drift. rw1c
+        # subtracts the mean, which is what makes the level alpha's job.
+        lay_rw1  = M.ParamLayout(data.S, data.n_years, false, M.PROC_RW1)
+        lay_rw1c = M.ParamLayout(data.S, data.n_years, false, M.PROC_RW1C)
+        th = M.initial_theta(lay_rw1) .+ 0.11
+
+        P1  = M.extract_params(th, lay_rw1)
+        P1c = M.extract_params(th, lay_rw1c)
+        @test abs(sum(P1c.gamma)) < 1e-10          # sums to zero by construction
+        @test abs(sum(P1.gamma)) > 1e-6            # plain rw1 does not
+        # rw1c is rw1 shifted by a constant, and only by a constant.
+        shift = P1.gamma .- P1c.gamma
+        @test maximum(shift) - minimum(shift) < 1e-10
+        @test !isapprox(M.logposterior(th, data, lay_rw1,  se_ab, sp_ab, true),
+                        M.logposterior(th, data, lay_rw1c, se_ab, sp_ab, true))
+    end
+
+    @testset "the data-adaptive increment prior" begin
+        # sd grows with how well the link is informed: pinned at the floor when
+        # neither year was tested, approaching TAU once both are well tested.
+        @test M.year_link_sd(0.0) ≈ M.YEAR_LINK_FLOOR
+        @test M.year_link_sd(1.0) < M.year_link_sd(10.0) < M.year_link_sd(1000.0)
+        @test M.year_link_sd(1e6) < M.YEAR_LINK_TAU + M.YEAR_LINK_FLOOR
+
+        # Counted over raw INPUT ROWS, not gridded captures: build_data stacks
+        # repeat captures within a timestep, so the two differ wherever a badger
+        # was caught twice in one quarter. Rows are the evidence count.
+        yw = M.year_weights(mat, fill(true, 6), data.n_years, data.S)
+        @test length(yw) == data.n_years
+        @test sum(yw) == count(r -> any(!isnan, @view mat[r, 4:9]), axes(mat, 1))
+
+        # A masked-out assay is not evidence either.
+        yw_cult = M.year_weights(mat, [false,false,true,false,false,false],
+                                 data.n_years, data.S)
+        @test sum(yw_cult) <= sum(yw)
+
+        # The prior must actually change the density, and its adjoint must be
+        # right in both spaces.
+        lay = M.ParamLayout(data.S, data.n_years, false, M.PROC_RW1C)
+        th = M.initial_theta(lay) .+ 0.09
+        @test !isapprox(M.logposterior(th, data, lay, se_pr_b, sp_pr_b, true, nothing),
+                        M.logposterior(th, data, lay, se_pr_b, sp_pr_b, true, yw))
+        for jac in (true, false)
+            logp = t -> M.logposterior(t, data, lay, se_pr_b, sp_pr_b, true, yw, jac)
+            ga = zeros(lay.n)
+            la = M.logposterior_grad!(ga, th, data, lay, se_pr_b, sp_pr_b, true, yw, jac)
+            gf = zeros(lay.n)
+            lf = M.gradient!(gf, logp, th, Val(13))
+            @test isapprox(la, lf; atol = 1e-8)
+            @test maximum(abs.(ga .- gf)) < 1e-10
+        end
+    end
+
+    @testset "logit-normal accuracy priors" begin
+        # Each literature point value is the prior MEDIAN, and the central 95%
+        # must cover both supplied interval endpoints -- the intervals are
+        # asymmetric on the logit scale, so the wider half sets the SD.
+        for k in 1:6
+            mu, sd = M.logitnormal_from_interval(M.SE_FIXED_DEFAULT[k],
+                        M.SE_CI_DEFAULT[k][1], M.SE_CI_DEFAULT[k][2])
+            @test M.logistic(mu) ≈ M.SE_FIXED_DEFAULT[k]
+            @test M.logistic(mu - 1.959963984540054sd) <= M.SE_CI_DEFAULT[k][1] + 1e-12
+            @test M.logistic(mu + 1.959963984540054sd) >= M.SE_CI_DEFAULT[k][2] - 1e-12
+        end
+
+        # Unlike Beta, a logit-normal never diverges at a boundary, which is
+        # what makes MAP well posed.
+        se_ln, sp_ln = M.default_accuracy_priors(M.ACC_LOGITNORMAL)
+        @test !any(M.is_singular_at_boundary, se_ln)
+        @test !any(M.is_singular_at_boundary, sp_ln)
+        # The Beta defaults DO, which is why MAP refuses them.
+        se_b, sp_b = M.default_accuracy_priors(M.ACC_BETA)
+        @test any(M.is_singular_at_boundary, (se_b..., sp_b...))
+
+        lay = M.ParamLayout(data.S, data.n_years, true, M.PROC_RW1C)
+        th = M.initial_theta(lay) .+ 0.05
+        for jac in (true, false)
+            logp = t -> M.logposterior(t, data, lay, se_ln, sp_ln, true, nothing, jac)
+            ga = zeros(lay.n)
+            la = M.logposterior_grad!(ga, th, data, lay, se_ln, sp_ln, true, nothing, jac)
+            gf = zeros(lay.n)
+            lf = M.gradient!(gf, logp, th, Val(25))
+            @test isapprox(la, lf; atol = 1e-8)
+            @test maximum(abs.(ga .- gf)) < 1e-10
+        end
+    end
+
+    @testset "pinned specificities" begin
+        pin = (NaN, NaN, 1.0, NaN, NaN, NaN)
+        lay_free = M.ParamLayout(data.S, data.n_years, true, M.PROC_RW1C)
+        lay_pin  = M.ParamLayout(data.S, data.n_years, true, M.PROC_RW1C, pin)
+
+        # A pin REMOVES a parameter; it is not a masked gradient entry.
+        @test lay_pin.n == lay_free.n - 1
+        @test lay_pin.sp_slot[3] == 0
+        @test all(lay_pin.sp_slot[k] != 0 for k in (1, 2, 4, 5, 6))
+        # Later tests shift down to fill the gap.
+        @test lay_pin.sp_slot[4] == lay_free.sp_slot[4] - 1
+        # Names must follow the slots, or they label the wrong values.
+        @test length(M.param_names(lay_pin)) == lay_pin.n
+        @test !("Sp[3]" in M.param_names(lay_pin))
+        @test "Sp[4]" in M.param_names(lay_pin)
+
+        # The pinned value must reach the likelihood and the decoder.
+        th = M.initial_theta(lay_pin) .+ 0.05
+        @test M.extract_params(th, lay_pin).Sp[3] == 1.0
+
+        se_ln, sp_ln = M.default_accuracy_priors(M.ACC_LOGITNORMAL)
+        for jac in (true, false)
+            logp = t -> M.logposterior(t, data, lay_pin, se_ln, sp_ln, true, nothing, jac)
+            ga = zeros(lay_pin.n)
+            la = M.logposterior_grad!(ga, th, data, lay_pin, se_ln, sp_ln, true,
+                                      nothing, jac)
+            gf = zeros(lay_pin.n)
+            lf = M.gradient!(gf, logp, th, Val(25))
+            @test isapprox(la, lf; atol = 1e-8)
+            @test maximum(abs.(ga .- gf)) < 1e-10
+        end
+
+        # With Se/Sp FIXED a pin overrides the Table 1 value rather than
+        # removing a parameter -- still a different model, not a no-op.
+        lay_fx     = M.ParamLayout(data.S, data.n_years, false, M.PROC_RW1C)
+        lay_fx_pin = M.ParamLayout(data.S, data.n_years, false, M.PROC_RW1C, pin)
+        @test lay_fx_pin.n == lay_fx.n
+        @test M.extract_params(M.initial_theta(lay_fx_pin), lay_fx_pin).Sp[3] == 1.0
+        thf = M.initial_theta(lay_fx) .+ 0.05
+        @test !isapprox(M.logposterior(thf, data, lay_fx,     se_ab, sp_ab, true),
+                        M.logposterior(thf, data, lay_fx_pin, se_ab, sp_ab, true))
+    end
+
+    @testset "MAP and sampling target different spaces" begin
+        # Turing's maximum_a_posteriori maximises the CONSTRAINED density, so
+        # the two differ by exactly the transform Jacobian. Both must be
+        # available, and each must match the primal it is paired with.
+        lay = M.ParamLayout(data.S, data.n_years, false, M.PROC_RW1C)
+        th = M.initial_theta(lay) .+ 0.05
+        lp_j  = M.logposterior(th, data, lay, se_pr_b, sp_pr_b, true, nothing, true)
+        lp_nj = M.logposterior(th, data, lay, se_pr_b, sp_pr_b, true, nothing, false)
+        # For fixed Se/Sp the only transformed parameter is sigma_g.
+        @test lp_j - lp_nj ≈ th[lay.i_logsigma]
+    end
+
     @testset "the year processes are genuinely different models" begin
         # A wrong gamma map would still sample; it would just sample the wrong
         # posterior. Pin the actual arithmetic rather than only the gradient.
@@ -621,7 +768,8 @@ const SPARSE = joinpath(@__DIR__, "..", "testdata", "sparse.csv")
         out = mktempdir()
         opts = M.Options(DATA, "nuts", out, 4, fill(true, 6), false, true,
                          :stack, 60, 60, 0.8, 3, 1000, M.PROC_RW1, 10,
-                         "", "", "", -1.0, -1)
+                         "", "", "", -1.0, -1,
+                         M.ACC_BETA, false, M.NO_SP_PIN)
         M.draw_outputs(opts, data, layout, res.draws, 10)
 
         pd = M.read_matrix(joinpath(out, "prevalence_draws.csv"))
@@ -649,7 +797,8 @@ const SPARSE = joinpath(@__DIR__, "..", "testdata", "sparse.csv")
         out2 = mktempdir()
         opts2 = M.Options(DATA, "nuts", out2, 4, fill(true, 6), false, true,
                           :stack, 60, 60, 0.8, 3, 1000, M.PROC_RW1, 0,
-                          "", "", "", -1.0, -1)
+                          "", "", "", -1.0, -1,
+                          M.ACC_BETA, false, M.NO_SP_PIN)
         M.draw_outputs(opts2, data, layout, res.draws, 0)
         @test !isfile(joinpath(out2, "prevalence_draws.csv"))
         @test !isfile(joinpath(out2, "trajectories.csv"))

@@ -184,6 +184,11 @@ term and no gradient entry. `sp_slot[k]` is that test's index in θ, or 0 when i
 is pinned, so `n` shrinks by one per pinned test. Pinning culture (test 3) with
 Se/Sp otherwise inferred gives n = 69 rather than 70 -- which is why this cannot
 be done by masking a gradient after the fact.
+
+With Se/Sp FIXED a pin is still meaningful: it OVERRIDES that test's Table 1
+value. Pinning culture to 1.0 replaces the tabulated 0.999, which is a different
+model, not a no-op -- it asserts that a culture positive is never a false
+positive, and it moves the log posterior substantially.
 """
 struct ParamLayout
     S::Int
@@ -235,9 +240,12 @@ function ParamLayout(S::Int, n_years::Int, infer_sesp::Bool,
         n = next - 1
         pins = sp_pin
     else
+        # No slots when Se/Sp are fixed -- but the pins are RETAINED, because
+        # there they override the Table 1 specificity rather than removing a
+        # parameter.
         slots = ntuple(_ -> 0, N_TESTS)
         n = i_pi1_mult
-        pins = NO_SP_PIN
+        pins = sp_pin
     end
     return ParamLayout(S, n_years, infer_sesp, year_process, n, i_alpha,
                        i_logsigma, i_gamma, i_pi1_0, i_pi1_mult, i_se, i_sp,
@@ -545,7 +553,10 @@ function logposterior(theta::AbstractVector{T}, data::HMMData, layout::ParamLayo
     else
         @inbounds for k in 1:N_TESTS
             Se[k] = T(SE_FIXED_DEFAULT[k])
-            Sp[k] = T(SP_FIXED_DEFAULT[k])
+            # A pin overrides the tabulated value; both are constants here, so
+            # this shifts the density without adding a parameter.
+            Sp[k] = T(isnan(layout.sp_pin[k]) ? SP_FIXED_DEFAULT[k] :
+                                                layout.sp_pin[k])
         end
     end
 
@@ -624,7 +635,8 @@ function extract_params(theta::Vector{Float64}, layout::ParamLayout)
               logistic(theta[layout.sp_slot[k]]) for k in 1:N_TESTS]
     else
         Se = [SE_FIXED_DEFAULT[k] for k in 1:N_TESTS]
-        Sp = [SP_FIXED_DEFAULT[k] for k in 1:N_TESTS]
+        Sp = [isnan(layout.sp_pin[k]) ? SP_FIXED_DEFAULT[k] : layout.sp_pin[k]
+              for k in 1:N_TESTS]
     end
     return Params(alpha, sigma_g, gamma, pi1_0, pi1_mult, pi1_vec, Se, Sp)
 end

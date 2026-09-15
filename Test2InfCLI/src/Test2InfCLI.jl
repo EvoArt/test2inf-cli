@@ -80,13 +80,15 @@ OPTIONS:
                        interior maximum and is refused. logitnormal takes each
                        literature value as the prior MEDIAN and vanishes at both
                        boundaries.
-  --pin-sp <k>=<v>     Pin assay k's specificity to v, leaving the others
-                       inferred. Repeatable. Requires --infer-sesp. `--pin-sp
+  --pin-sp <k>=<v>     Pin assay k's specificity to v. Repeatable. `--pin-sp
                        3=1.0` states that a culture positive is never a false
                        positive -- the carry-forward assumption expressed inside
                        the model rather than imported as a data transformation.
-                       A pinned assay is a constant: it loses its parameter slot
-                       and its prior, so the parameter count drops.
+                       With --infer-sesp the pinned assay stops being a
+                       parameter: it loses its slot and its prior, so the
+                       parameter count drops. With Se/Sp fixed it overrides that
+                       assay's Table 1 value (culture 0.999 -> 1.0), which is a
+                       different model, not a no-op.
   --no-penalty         Drop the Se+Sp>1 identifiability penalty
   --repeat <mode>      stack | pool | last                 (default: stack)
   --draws <int>        NUTS post-warmup draws              (default: 1000)
@@ -322,13 +324,6 @@ function parse_args(args::Vector{String})
     if method == "hmc" && isempty(model) && (hmc_eps <= 0.0 || hmc_L <= 0)
         error("--method hmc needs --model (or both --hmc-eps and --hmc-L)")
     end
-    # Pinning a specificity only means something when Se/Sp are being inferred:
-    # with them fixed every Sp is already a constant, so a pin would silently do
-    # nothing. Say so rather than accept a flag that has no effect.
-    if any(!isnan, sp_pin) && !infer_sesp
-        error("--pin-sp requires --infer-sesp: with fixed Se/Sp every " *
-              "specificity is already a constant, so pinning one changes nothing.")
-    end
     return Options(data, method, out, seasons, tests, infer_sesp, penalty,
                    repeat_captures, draws, warmup, accept, seed, maxiter,
                    year_process, traj_draws, metric, write_metric_path,
@@ -358,7 +353,12 @@ function initial_theta(layout::ParamLayout)
         for k in 1:N_TESTS
             # Start at the Table 1 values on the logit scale.
             theta[layout.i_se + k - 1] = log(SE_FIXED_DEFAULT[k] / (1 - SE_FIXED_DEFAULT[k]))
-            theta[layout.i_sp + k - 1] = log(SP_FIXED_DEFAULT[k] / (1 - SP_FIXED_DEFAULT[k]))
+            # Specificities are addressed through the slot map, not a
+            # contiguous block: a pinned test has no slot, and every later test
+            # shifts down by one.
+            slot = layout.sp_slot[k]
+            slot == 0 && continue
+            theta[slot] = log(SP_FIXED_DEFAULT[k] / (1 - SP_FIXED_DEFAULT[k]))
         end
     end
     return theta
@@ -379,7 +379,10 @@ function param_names(layout::ParamLayout)
         for k in 1:N_TESTS
             push!(names, "Se[$k]")
         end
+        # Only the UNPINNED specificities occupy slots. Emitting all six here
+        # would shift every name past the pinned one onto the wrong value.
         for k in 1:N_TESTS
+            layout.sp_slot[k] == 0 && continue
             push!(names, "Sp[$k]")
         end
     end

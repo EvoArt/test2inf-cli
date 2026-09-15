@@ -103,7 +103,10 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
     else
         @inbounds for k in 1:N_TESTS
             Se[k] = SE_FIXED_DEFAULT[k]
-            Sp[k] = SP_FIXED_DEFAULT[k]
+            # A pin overrides the tabulated value. Both are constants, so this
+            # moves the density but contributes no gradient either way.
+            Sp[k] = isnan(layout.sp_pin[k]) ? SP_FIXED_DEFAULT[k] :
+                                              layout.sp_pin[k]
         end
     end
 
