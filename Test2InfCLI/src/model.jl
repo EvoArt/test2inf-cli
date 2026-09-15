@@ -15,6 +15,28 @@ const HAZARD_PRIOR_MEAN = -3.0
 const HAZARD_PRIOR_SD   = 1.5
 const PENALTY_WEIGHT    = 50.0
 const PENALTY_SCALE     = 0.02
+
+# Data-adaptive year-increment prior (`year_weight`). The rw1 increments are
+# unidentified wherever there is no test data, so the walk drifts freely there --
+# which is what put 1976-77 (54 tested captures, zero positives) at the two
+# highest hazards in the series. Tightening the prior everywhere would fight
+# 16,255 likelihood terms in the years that DO have data. Instead tighten each
+# link in proportion to how little data informs it:
+#
+#     gamma[y] - gamma[y-1] ~ Normal(0, sd_y)
+#     sd_y = TAU * n_eff/(1 + n_eff) + FLOOR,  n_eff = min(w[y], w[y-1])
+#
+# n_eff is the SMALLER of the two adjacent counts: an increment is identified
+# only if both endpoints have data. sd_y GROWS with n_eff, so a link between two
+# well-tested years is essentially free and a link into an untested year is
+# pinned to its neighbour. TAU is deliberately loose so the prior does not fight
+# the data in the 45 well-tested years.
+const YEAR_LINK_TAU   = 1.0
+const YEAR_LINK_FLOOR = 0.05
+
+"SD of the year-to-year increment prior, given the effective count for that link."
+@inline year_link_sd(n_eff::Float64) =
+    YEAR_LINK_TAU * (n_eff / (1.0 + n_eff)) + YEAR_LINK_FLOOR
 # Year-effect process. These MUST track test2infeR's build_gamma/sigma_prior:
 #   iid  gamma = sigma_g .* raw           sigma_g ~ Normal+(0, 0.30)
 #   rw1  gamma = sigma_g .* cumsum(raw)   sigma_g ~ Normal+(0, 0.05)
@@ -31,11 +53,13 @@ const PROC_RW1    = 1
 const PROC_RW2    = 2
 const PROC_NONE   = 3
 const PROC_SHRUNK = 4
+const PROC_RW1C   = 5
 
 const SIGMA_G_PRIOR_SD_IID    = 0.30
 const SIGMA_G_PRIOR_SD_RW1    = 0.05
 const SIGMA_G_PRIOR_SD_RW2    = 0.01
 const SIGMA_G_PRIOR_SD_SHRUNK = 0.10
+const SIGMA_G_PRIOR_SD_RW1C   = 0.05
 
 # The sigma prior is part of the process, not an independent knob: a process
 # that accumulates would give far larger year effects at the same sigma. These
@@ -43,6 +67,7 @@ const SIGMA_G_PRIOR_SD_SHRUNK = 0.10
 # 0.30 default there.
 @inline function sigma_prior_sd(proc::Int)
     proc == PROC_RW1    && return SIGMA_G_PRIOR_SD_RW1
+    proc == PROC_RW1C   && return SIGMA_G_PRIOR_SD_RW1C
     proc == PROC_RW2    && return SIGMA_G_PRIOR_SD_RW2
     proc == PROC_SHRUNK && return SIGMA_G_PRIOR_SD_SHRUNK
     return SIGMA_G_PRIOR_SD_IID          # iid and none
@@ -59,7 +84,15 @@ Year effects from the unconstrained `raw` vector, matching test2infeR's
     shrunk  gamma_y = sigma_g * raw_y            (differs from iid only in the
                                                   sigma prior, 0.10 vs 0.30)
     rw1     gamma_y = sigma_g * sum_{k<=y} raw_k
+    rw1c    gamma_y = rw1_y - mean(rw1)          (sum-to-zero constrained)
     rw2     gamma_y = sigma_g * cumsum(cumsum(raw))_y
+
+`rw1c` centres the walk so it is a pure DEVIATION series. Plain `rw1` leaves the
+LEVEL unidentified -- `gamma[1]` is a free parameter and every later year is an
+increment from it, so nothing anchors where the walk sits, and years with no
+test data drift. Centring makes the level the job of `alpha`, which its own
+prior and every capture in the study do anchor. Standard identifiability
+constraint for RW/ICAR temporal effects.
 
 `raw_at(y)` reads the y-th raw value, so this works for both `Float64` and the
 dual numbers the forward-mode reference uses.
@@ -75,6 +108,23 @@ dual numbers the forward-mode reference uses.
         @inbounds for y in 1:n_years
             acc = acc + raw_at(y)
             gamma[y] = sigma_g * acc
+        end
+    elseif proc == PROC_RW1C
+        # Two passes: accumulate the walk, then subtract its own mean. The mean
+        # is over the same vector being written, so it cannot be folded into the
+        # first pass.
+        acc = zero(sigma_g)
+        @inbounds for y in 1:n_years
+            acc = acc + raw_at(y)
+            gamma[y] = sigma_g * acc
+        end
+        tot = zero(sigma_g)
+        @inbounds for y in 1:n_years
+            tot = tot + gamma[y]
+        end
+        mu = tot / n_years
+        @inbounds for y in 1:n_years
+            gamma[y] = gamma[y] - mu
         end
     elseif proc == PROC_RW2
         # cumsum of the cumsum: `acc` is the running sum of raw, `acc2` the
@@ -122,16 +172,23 @@ end
 Which parameters are free, and where they sit in the flat vector θ.
 
 Layout:  alpha[1:S], log_sigma_g, gamma_raw[1:n_years], pi1_0, pi1_mult,
-         then (if infer_sesp) logit_Se[1:6], logit_Sp[1:6].
+         then (if infer_sesp) logit_Se[1:6], then a slot for each UNPINNED
+         logit_Sp.
 
 sigma_g and Se/Sp are stored unconstrained (log / logit) so the optimiser and
 the sampler both work on an unbounded space -- this replaces Bijectors.
+
+A pinned specificity is a constant, not a parameter: it gets no slot, no prior
+term and no gradient entry. `sp_slot[k]` is that test's index in θ, or 0 when it
+is pinned, so `n` shrinks by one per pinned test. Pinning culture (test 3) with
+Se/Sp otherwise inferred gives n = 69 rather than 70 -- which is why this cannot
+be done by masking a gradient after the fact.
 """
 struct ParamLayout
     S::Int
     n_years::Int
     infer_sesp::Bool
-    year_process::Int          # PROC_IID or PROC_RW1
+    year_process::Int
     n::Int
     i_alpha::Int
     i_logsigma::Int
@@ -140,10 +197,17 @@ struct ParamLayout
     i_pi1_mult::Int
     i_se::Int
     i_sp::Int
+    sp_pin::NTuple{N_TESTS,Float64}   # NaN = free, otherwise the pinned value
+    sp_slot::NTuple{N_TESTS,Int}      # index in θ, or 0 when pinned
 end
 
+const NO_SP_PIN = ntuple(_ -> NaN, N_TESTS)
+
+@inline is_pinned(layout::ParamLayout, k::Int) = layout.sp_slot[k] == 0
+
 function ParamLayout(S::Int, n_years::Int, infer_sesp::Bool,
-                     year_process::Int = PROC_RW1)
+                     year_process::Int = PROC_RW1,
+                     sp_pin::NTuple{N_TESTS,Float64} = NO_SP_PIN)
     i_alpha = 1
     i_logsigma = i_alpha + S
     i_gamma = i_logsigma + 1
@@ -151,9 +215,32 @@ function ParamLayout(S::Int, n_years::Int, infer_sesp::Bool,
     i_pi1_mult = i_pi1_0 + 1
     i_se = i_pi1_mult + 1
     i_sp = infer_sesp ? i_se + N_TESTS : i_se
-    n = infer_sesp ? i_sp + N_TESTS - 1 : i_pi1_mult
+    # Pinning only means anything when Se/Sp are inferred: with them fixed
+    # every Sp is already a constant.
+    if infer_sesp
+        # Built as a plain loop, not `ntuple` with a closure: a closure
+        # capturing the running counter boxes it (Core.Box), which erases its
+        # type and breaks trimming. Same reason `seed_partials` is a separate
+        # function in dual.jl.
+        slot_v = zeros(Int, N_TESTS)
+        next = i_sp
+        for k in 1:N_TESTS
+            if isnan(sp_pin[k])
+                slot_v[k] = next
+                next += 1
+            end
+        end
+        slots = NTuple{N_TESTS,Int}(slot_v)
+        n = next - 1
+        pins = sp_pin
+    else
+        slots = ntuple(_ -> 0, N_TESTS)
+        n = i_pi1_mult
+        pins = NO_SP_PIN
+    end
     return ParamLayout(S, n_years, infer_sesp, year_process, n, i_alpha,
-                       i_logsigma, i_gamma, i_pi1_0, i_pi1_mult, i_se, i_sp)
+                       i_logsigma, i_gamma, i_pi1_0, i_pi1_mult, i_se, i_sp,
+                       pins, slots)
 end
 
 # --- likelihood ------------------------------------------------------------
@@ -217,10 +304,71 @@ function beta_from_moments(mu::Float64, sd::Float64)
     return (max(mu * c, 0.5), max((1.0 - mu) * c, 0.5))
 end
 
+# --- accuracy priors -------------------------------------------------------
+# Two families, chosen by `accuracy_prior`:
+#
+#   ACC_BETA          Beta(a,b) on the probability, the historical default.
+#   ACC_LOGITNORMAL   LogitNormal(mu,sd), which the case uses for its inferred
+#                     variants.
+#
+# The Beta family has a defect this exists to escape: `beta_from_moments` floors
+# both shapes at 0.5, so a requested mean of 0.999 for culture specificity comes
+# back as Beta(3.26, 0.5) with mean 0.867 -- the moments are not what was asked
+# for -- and a shape below one makes the density diverge at the boundary, so MAP
+# has no interior maximum. `map_refuses_singular_beta` is the guard.
+#
+# LogitNormal has neither problem: the density vanishes at both boundaries, and
+# the literature point value is taken as the MEDIAN (which it is, by
+# construction) rather than the mean.
+const ACC_BETA        = 0
+const ACC_LOGITNORMAL = 1
+
+"""
+    logitnormal_from_interval(center, lo, hi) -> (mu, sd)
+
+Logit-scale mean and SD for a LogitNormal whose median is `center` and whose
+central 95% interval contains both `lo` and `hi`.
+
+The supplied intervals are asymmetric on the logit scale (Sp[4] is 0.881-0.999
+around 0.943, i.e. 1.6 logits below and 4.1 above), so no single SD reproduces
+both endpoints. Taking the LARGER half-width covers both rather than splitting
+the difference; the interval is then wider than asked for on the tighter side,
+which is the conservative direction.
+"""
+function logitnormal_from_interval(center::Float64, lo::Float64, hi::Float64)
+    mu = logit_f(center)
+    sd = max(mu - logit_f(lo), logit_f(hi) - mu) / 1.959963984540054
+    return (mu, sd)
+end
+
+@inline logit_f(x::Float64) = log(x) - log1p(-x)
+
+# In the UNCONSTRAINED space the CLI works in (z = logit(p)), a LogitNormal on p
+# is exactly a Normal on z: the logit Jacobian log(p) + log(1-p) cancels the
+# LogitNormal's own 1/(p(1-p)) factor. Verified against Distributions.jl to
+# 1.1e-13 over a grid of (mu, sd, z). So the prior term is normal_logpdf(z,...)
+# and its derivative is -(z-mu)/sd^2 -- no Jacobian term, unlike the Beta path.
+@inline logitnormal_logpdf_z(z::T, mu::Float64, sd::Float64) where {T} =
+    normal_logpdf(z, mu, sd)
+
 const SE_CI_DEFAULT = ((0.370, 0.530), (0.370, 0.530), (0.025, 0.373),
                        (0.502, 0.798), (0.640, 0.901), (0.441, 0.544))
 const SP_CI_DEFAULT = ((0.890, 0.980), (0.890, 0.980), (0.939, 0.999),
                        (0.881, 0.999), (0.621, 0.987), (0.622, 0.986))
+
+"""
+Prior parameters for one test's accuracy, in whichever family is in use.
+
+`family` selects the meaning of `(p, q)`: `(a, b)` for `ACC_BETA`, `(mu, sd)`
+on the logit scale for `ACC_LOGITNORMAL`. One concrete struct rather than a
+union keeps the log-posterior free of abstract fields to dispatch on, which is
+what makes it trimmable.
+"""
+struct AccuracyPrior
+    family::Int
+    p::Float64
+    q::Float64
+end
 
 "Beta (a,b) pairs for the Se and Sp priors, from the Table 1 means and CIs."
 function default_sesp_priors()
@@ -233,6 +381,70 @@ function default_sesp_priors()
     return se_ab, sp_ab
 end
 
+"Accuracy priors in `family`, from the Table 1 point values and intervals."
+function default_accuracy_priors(family::Int)
+    if family == ACC_BETA
+        se_ab, sp_ab = default_sesp_priors()
+        se = ntuple(k -> AccuracyPrior(ACC_BETA, se_ab[k][1], se_ab[k][2]), N_TESTS)
+        sp = ntuple(k -> AccuracyPrior(ACC_BETA, sp_ab[k][1], sp_ab[k][2]), N_TESTS)
+        return se, sp
+    end
+    se = ntuple(N_TESTS) do k
+        mu, sd = logitnormal_from_interval(SE_FIXED_DEFAULT[k],
+                                           SE_CI_DEFAULT[k][1], SE_CI_DEFAULT[k][2])
+        AccuracyPrior(ACC_LOGITNORMAL, mu, sd)
+    end
+    sp = ntuple(N_TESTS) do k
+        mu, sd = logitnormal_from_interval(SP_FIXED_DEFAULT[k],
+                                           SP_CI_DEFAULT[k][1], SP_CI_DEFAULT[k][2])
+        AccuracyPrior(ACC_LOGITNORMAL, mu, sd)
+    end
+    return se, sp
+end
+
+const AccuracyPriors = NTuple{N_TESTS,AccuracyPrior}
+
+"""
+Log density of one accuracy prior, as a function of the UNCONSTRAINED
+parameter `z = logit(p)`, including any transform Jacobian.
+
+  Beta:        beta_logpdf_kernel(p,a,b) + log(p) + log(1-p)
+  LogitNormal: normal_logpdf(z, mu, sd)   -- the Jacobian cancels exactly,
+               verified against Distributions.jl to 1.1e-13.
+"""
+@inline function accuracy_logpdf_z(pr::AccuracyPrior, z::T, p::T) where {T}
+    if pr.family == ACC_LOGITNORMAL
+        return normal_logpdf(z, pr.p, pr.q)
+    end
+    return beta_logpdf_kernel(p, pr.p, pr.q) + log(p) + log(one(T) - p)
+end
+
+"""
+d(log prior)/dz for one accuracy parameter.
+
+  LogitNormal: -(z - mu)/sd^2
+  Beta:        ((a-1)/p - (b-1)/(1-p)) * p(1-p) + (1 - 2p)
+               where p(1-p) is dp/dz and (1-2p) is d/dz of the Jacobian term.
+"""
+@inline function accuracy_dlogpdf_dz(pr::AccuracyPrior, z::Float64, p::Float64)
+    if pr.family == ACC_LOGITNORMAL
+        return -(z - pr.p) / (pr.q * pr.q)
+    end
+    dp = p * (1.0 - p)
+    return ((pr.p - 1.0) / p - (pr.q - 1.0) / (1.0 - p)) * dp + (1.0 - 2.0 * p)
+end
+
+"""
+Does `pr` have a density that diverges at a probability boundary?
+
+Only Beta can: a shape below one sends the density to infinity at 0 or 1, so
+there is no interior maximum and a MAP estimate is not well defined. The engine
+refuses MAP in that case rather than reporting whatever the optimiser stopped
+at. LogitNormal vanishes at both boundaries, so it is always safe.
+"""
+@inline is_singular_at_boundary(pr::AccuracyPrior) =
+    pr.family == ACC_BETA && (pr.p < 1.0 || pr.q < 1.0)
+
 # --- log posterior ---------------------------------------------------------
 """
     logposterior(theta, data, layout, se_ab, sp_ab, penalty)
@@ -242,9 +454,9 @@ terms for the log/logit transforms. Generic in the element type of `theta` so
 the dual-number gradient runs through the identical code path.
 """
 function logposterior(theta::AbstractVector{T}, data::HMMData, layout::ParamLayout,
-                      se_ab::NTuple{N_TESTS,Tuple{Float64,Float64}},
-                      sp_ab::NTuple{N_TESTS,Tuple{Float64,Float64}},
-                      penalty::Bool) where {T}
+                      se_pr::AccuracyPriors, sp_pr::AccuracyPriors,
+                      penalty::Bool,
+                      year_weight::Union{Nothing,Vector{Float64}} = nothing) where {T}
     S = layout.S
     n_years = layout.n_years
     lp = zero(T)
@@ -256,14 +468,12 @@ function logposterior(theta::AbstractVector{T}, data::HMMData, layout::ParamLayo
         lp = lp + normal_logpdf(alpha[s], HAZARD_PRIOR_MEAN, HAZARD_PRIOR_SD)
     end
 
-    # sigma_g ~ Normal+(0, 0.3), stored as log_sigma_g; + log|J| = log_sigma_g
+    # sigma_g ~ Normal+(0, sd), stored as log_sigma_g; + log|J| = log_sigma_g
     log_sigma = theta[layout.i_logsigma]
     sigma_g = exp(log_sigma)
     lp = lp + normal_logpdf(sigma_g, 0.0, sigma_prior_sd(layout.year_process)) + log_sigma
 
-    # gamma_raw ~ Normal(0,1), then the process maps raw to the year effects:
-    #   iid  gamma_y = sigma_g * raw_y
-    #   rw1  gamma_y = sigma_g * sum(raw_1..raw_y)     (a random walk)
+    # gamma_raw ~ Normal(0,1), then the process maps raw to the year effects.
     gamma = Vector{T}(undef, n_years)
     @inbounds for y in 1:n_years
         lp = lp + normal_logpdf(theta[layout.i_gamma + y - 1], 0.0, 1.0)
@@ -271,26 +481,40 @@ function logposterior(theta::AbstractVector{T}, data::HMMData, layout::ParamLayo
     build_gamma!(gamma, y -> theta[layout.i_gamma + y - 1], sigma_g,
                  layout.year_process, n_years)
 
+    # Data-adaptive increment prior. `sd_y` depends only on the data, so this
+    # contributes through gamma alone.
+    if year_weight !== nothing
+        yw = year_weight
+        @inbounds for y in 2:n_years
+            n_eff = min(yw[y], yw[y - 1])
+            lp = lp + normal_logpdf(gamma[y] - gamma[y - 1], 0.0, year_link_sd(n_eff))
+        end
+    end
+
     pi1_0 = theta[layout.i_pi1_0]
     pi1_mult = theta[layout.i_pi1_mult]
     lp = lp + normal_logpdf(pi1_0, -1.7, 1.0) + normal_logpdf(pi1_mult, 1.0, 1.0)
 
-    # Se/Sp: either fixed constants or inferred on the logit scale.
+    # Se/Sp: fixed constants, or inferred on the logit scale. A pinned
+    # specificity is a constant with no slot and no prior term.
     Se = Vector{T}(undef, N_TESTS)
     Sp = Vector{T}(undef, N_TESTS)
     if layout.infer_sesp
         @inbounds for k in 1:N_TESTS
             zse = theta[layout.i_se + k - 1]
-            zsp = theta[layout.i_sp + k - 1]
             se = logistic(zse)
-            sp = logistic(zsp)
             Se[k] = se
-            Sp[k] = sp
-            a, b = se_ab[k]
-            c, d = sp_ab[k]
-            # + log|J| for the logit transform: log(p) + log(1-p)
-            lp = lp + beta_logpdf_kernel(se, a, b) + log(se) + log(one(T) - se)
-            lp = lp + beta_logpdf_kernel(sp, c, d) + log(sp) + log(one(T) - sp)
+            lp = lp + accuracy_logpdf_z(se_pr[k], zse, se)
+
+            slot = layout.sp_slot[k]
+            if slot == 0
+                Sp[k] = T(layout.sp_pin[k])
+            else
+                zsp = theta[slot]
+                sp = logistic(zsp)
+                Sp[k] = sp
+                lp = lp + accuracy_logpdf_z(sp_pr[k], zsp, sp)
+            end
         end
     else
         @inbounds for k in 1:N_TESTS
@@ -299,12 +523,12 @@ function logposterior(theta::AbstractVector{T}, data::HMMData, layout::ParamLayo
         end
     end
 
-    # The Se+Sp>1 penalty applies in BOTH cases, matching the package, which
-    # puts it outside its own `se_fixed === nothing` branch. With Se/Sp fixed it
-    # is a constant (-0.3529 at the Table 1 values, essentially all of it from
+    # The Se+Sp>1 penalty applies in BOTH cases, matching the engine, which puts
+    # it outside its own `se_fixed === nothing` branch. With Se/Sp fixed it is a
+    # constant (-0.3529 at the Table 1 values, essentially all of it from
     # Culture, where Se+Sp-1 = 0.099) so it shifts no gradient and moves no
     # optimum -- but it does shift the log density, and log densities have to be
-    # comparable with the package's for model comparison to mean anything.
+    # comparable with the engine's for model comparison to mean anything.
     if penalty
         @inbounds for k in 1:N_TESTS
             lp = lp - PENALTY_WEIGHT *
@@ -326,6 +550,16 @@ function logposterior(theta::AbstractVector{T}, data::HMMData, layout::ParamLayo
         start = e + 1
     end
     return lp
+end
+
+# Back-compatible entry point for callers holding raw Beta (a,b) pairs.
+function logposterior(theta::AbstractVector{T}, data::HMMData, layout::ParamLayout,
+                      se_ab::NTuple{N_TESTS,Tuple{Float64,Float64}},
+                      sp_ab::NTuple{N_TESTS,Tuple{Float64,Float64}},
+                      penalty::Bool) where {T}
+    se_pr = ntuple(k -> AccuracyPrior(ACC_BETA, se_ab[k][1], se_ab[k][2]), N_TESTS)
+    sp_pr = ntuple(k -> AccuracyPrior(ACC_BETA, sp_ab[k][1], sp_ab[k][2]), N_TESTS)
+    return logposterior(theta, data, layout, se_pr, sp_pr, penalty, nothing)
 end
 
 # --- parameter extraction --------------------------------------------------
@@ -354,7 +588,14 @@ function extract_params(theta::Vector{Float64}, layout::ParamLayout)
     pi1_vec = [clamp_prob(logistic(pi1_0 + pi1_mult * gamma[y])) for y in 1:n_years]
     if layout.infer_sesp
         Se = [logistic(theta[layout.i_se + k - 1]) for k in 1:N_TESTS]
-        Sp = [logistic(theta[layout.i_sp + k - 1]) for k in 1:N_TESTS]
+        # Must mirror the model exactly: a pinned Sp[k] is what the fit used, so
+        # the smoother has to see the pinned value. Reading a slot for a pinned
+        # test would read some other parameter entirely, and reconstructing it
+        # from a prior the fit never sampled is the `pi1_free` bug in another
+        # costume -- the posterior would be decoded under parameters the
+        # likelihood never saw.
+        Sp = [layout.sp_slot[k] == 0 ? layout.sp_pin[k] :
+              logistic(theta[layout.sp_slot[k]]) for k in 1:N_TESTS]
     else
         Se = [SE_FIXED_DEFAULT[k] for k in 1:N_TESTS]
         Sp = [SP_FIXED_DEFAULT[k] for k in 1:N_TESTS]

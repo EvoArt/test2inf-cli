@@ -63,9 +63,9 @@ Verified against both central finite differences and the forward-mode AD.
 """
 function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
                             data::HMMData, layout::ParamLayout,
-                            se_ab::NTuple{N_TESTS,Tuple{Float64,Float64}},
-                            sp_ab::NTuple{N_TESTS,Tuple{Float64,Float64}},
-                            penalty::Bool)
+                            se_pr::AccuracyPriors, sp_pr::AccuracyPriors,
+                            penalty::Bool,
+                            year_weight::Union{Nothing,Vector{Float64}} = nothing)
     S = layout.S
     n_years = layout.n_years
     infer = layout.infer_sesp
@@ -93,7 +93,11 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
     if infer
         @inbounds for k in 1:N_TESTS
             Se[k] = logistic(theta[layout.i_se + k - 1])
-            Sp[k] = logistic(theta[layout.i_sp + k - 1])
+            # A pinned specificity is a constant: it has no slot to read and
+            # gets no gradient entry, but it still enters every emission and
+            # the Se+Sp>1 penalty.
+            Sp[k] = layout.sp_slot[k] == 0 ? layout.sp_pin[k] :
+                    logistic(theta[layout.sp_slot[k]])
         end
     else
         @inbounds for k in 1:N_TESTS
@@ -137,24 +141,45 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
     g[layout.i_pi1_mult] += -(pi1_mult - 1.0)
 
     # --- Se/Sp priors and the identifiability penalty ----------------------
-    # Se_k = logistic(z), so the Beta kernel plus the logit log|J| is
-    #   (a-1)log(p) + (b-1)log(1-p) + log(p) + log(1-p)
-    #     = a*log(p) + b*log(1-p),
-    # whose derivative wrt p is a/p - b/(1-p). Accumulated on the natural
-    # scale here, exactly like the likelihood's contribution, and converted to
-    # the logit scale in one place at the end.
+    # Two prior families, and they differ in WHICH SCALE their derivative is
+    # natural on, so they are handled differently here:
+    #
+    #   Beta. The kernel plus the logit log|J| is
+    #     (a-1)log(p) + (b-1)log(1-p) + log(p) + log(1-p) = a*log(p) + b*log(1-p),
+    #   whose derivative wrt p is a/p - b/(1-p). That is a NATURAL-scale
+    #   derivative, so it joins sebar/spbar and picks up the logit Jacobian with
+    #   everything else at the end.
+    #
+    #   LogitNormal. In this unconstrained space it is exactly Normal(z; mu,sd)
+    #   -- the logit Jacobian cancels the LogitNormal's own 1/(p(1-p)) factor
+    #   (verified against Distributions.jl to 1.1e-13). Its derivative
+    #   -(z-mu)/sd^2 is therefore already on the LOGIT scale and must go
+    #   straight into `g`, NOT through sebar/spbar, or it would be multiplied by
+    #   the Jacobian a second time.
     if infer
         @inbounds for k in 1:N_TESTS
             se = Se[k]
-            sp = Sp[k]
-            a, b = se_ab[k]
-            c, d = sp_ab[k]
-            lp += (a - 1.0) * log(se) + (b - 1.0) * log(1.0 - se) +
-                  log(se) + log(1.0 - se)
-            lp += (c - 1.0) * log(sp) + (d - 1.0) * log(1.0 - sp) +
-                  log(sp) + log(1.0 - sp)
-            sebar[k] += a / se - b / (1.0 - se)
-            spbar[k] += c / sp - d / (1.0 - sp)
+            zse = theta[layout.i_se + k - 1]
+            lp += accuracy_logpdf_z(se_pr[k], zse, se)
+            if se_pr[k].family == ACC_LOGITNORMAL
+                g[layout.i_se + k - 1] += accuracy_dlogpdf_dz(se_pr[k], zse, se)
+            else
+                sebar[k] += se_pr[k].p / se - se_pr[k].q / (1.0 - se)
+            end
+
+            # A pinned specificity contributes no prior term at all: the engine
+            # does not sample it, so there is nothing to score.
+            slot = layout.sp_slot[k]
+            if slot != 0
+                sp = Sp[k]
+                zsp = theta[slot]
+                lp += accuracy_logpdf_z(sp_pr[k], zsp, sp)
+                if sp_pr[k].family == ACC_LOGITNORMAL
+                    g[slot] += accuracy_dlogpdf_dz(sp_pr[k], zsp, sp)
+                else
+                    spbar[k] += sp_pr[k].p / sp - sp_pr[k].q / (1.0 - sp)
+                end
+            end
         end
     end
 
@@ -171,7 +196,10 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
             if infer
                 dpen = PENALTY_WEIGHT * logistic(x) / PENALTY_SCALE
                 sebar[k] += dpen
-                spbar[k] += dpen
+                # A pinned Sp is a constant, so the penalty still shifts lp
+                # through it but carries no derivative. Its Se partner does
+                # still get one.
+                layout.sp_slot[k] == 0 || (spbar[k] += dpen)
             end
         end
     end
@@ -373,6 +401,28 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
         start = e + 1
     end
 
+    # --- data-adaptive year-increment prior --------------------------------
+    # logpdf(Normal(0, sd_y), gamma[y] - gamma[y-1]) for each adjacent pair.
+    # `sd_y` depends only on the tested-capture counts, so it is a CONSTANT
+    # here: the whole contribution reaches the parameters through gamma, which
+    # is why this has to land in gbar_gamma BEFORE the year-process unwind
+    # below rather than going into `g` directly.
+    #
+    #   d/d(gamma[y])   = -(d/sd^2)   where d = gamma[y] - gamma[y-1]
+    #   d/d(gamma[y-1]) = +(d/sd^2)
+    if year_weight !== nothing
+        yw = year_weight
+        @inbounds for y in 2:n_years
+            n_eff = min(yw[y], yw[y - 1])
+            sd_y = year_link_sd(n_eff)
+            d = gamma[y] - gamma[y - 1]
+            lp += -0.5 * (d / sd_y)^2 - log(sd_y) - 0.9189385332046727
+            w = d / (sd_y * sd_y)
+            gbar_gamma[y]     -= w
+            gbar_gamma[y - 1] += w
+        end
+    end
+
     # --- fold the likelihood adjoints into g -------------------------------
     @inbounds for s in 1:S
         g[layout.i_alpha + s - 1] += gbar_alpha[s]
@@ -415,6 +465,26 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
             suffix += gbar_gamma[y]
             g[layout.i_gamma + y - 1] += suffix * sigma_g
         end
+    elseif proc == PROC_RW1C
+        # gamma = C * w, where w is the rw1 walk and C = I - (1/n)11' centres
+        # it. C is SYMMETRIC, so the adjoint of the centring step is the same
+        # operation on the adjoint vector: wbar = gbar - mean(gbar). Centring is
+        # applied LAST in the forward direction, so it is undone FIRST here,
+        # and only then does the reverse-cumsum of the rw1 walk run.
+        #
+        # Consequence worth noting: a constant shift in gbar contributes
+        # nothing, which is the gradient-side statement of the level being
+        # unidentified -- exactly what the constraint exists to fix.
+        mean_gbar = 0.0
+        @inbounds for y in 1:n_years
+            mean_gbar += gbar_gamma[y]
+        end
+        mean_gbar /= n_years
+        suffix = 0.0
+        @inbounds for y in n_years:-1:1
+            suffix += gbar_gamma[y] - mean_gbar
+            g[layout.i_gamma + y - 1] += suffix * sigma_g
+        end
     elseif proc == PROC_RW2
         suffix = 0.0
         suffix2 = 0.0
@@ -428,6 +498,10 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
             g[layout.i_gamma + y - 1] += gbar_gamma[y] * sigma_g
         end
     end
+    # gamma is LINEAR in sigma_g under every process (rw1c included -- centring
+    # is a linear map, so it commutes with the scalar), hence
+    # d(gamma)/d(log sigma) = gamma and the contraction is the same expression
+    # for all of them.
     if proc != PROC_NONE
         @inbounds for y in 1:n_years
             dlogsigma += gbar_gamma[y] * gamma[y]
@@ -435,12 +509,16 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
     end
     g[layout.i_logsigma] += dlogsigma
 
-    # Se_k = logistic(z_k): dSe/dz = Se*(1-Se). Everything above accumulated on
-    # the natural scale, so one Jacobian factor converts the lot.
+    # Se_k = logistic(z_k): dSe/dz = Se*(1-Se). The natural-scale adjoints
+    # (likelihood, penalty, and the Beta priors) are converted here in one
+    # place. LogitNormal prior terms are NOT in sebar/spbar -- they were added
+    # to `g` directly above, already on the logit scale.
     if infer
         @inbounds for k in 1:N_TESTS
             g[layout.i_se + k - 1] += sebar[k] * Se[k] * (1.0 - Se[k])
-            g[layout.i_sp + k - 1] += spbar[k] * Sp[k] * (1.0 - Sp[k])
+            slot = layout.sp_slot[k]
+            slot == 0 && continue          # pinned: constant, no gradient slot
+            g[slot] += spbar[k] * Sp[k] * (1.0 - Sp[k])
         end
     end
 
@@ -457,7 +535,18 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
                             data::HMMData, layout::ParamLayout,
                             penalty::Bool = true)
     layout.infer_sesp &&
-        error("the short form is for the fixed-Se/Sp model; pass se_ab, sp_ab, penalty")
-    se_ab, sp_ab = default_sesp_priors()
-    return logposterior_grad!(g, theta, data, layout, se_ab, sp_ab, penalty)
+        error("the short form is for the fixed-Se/Sp model; pass se_pr, sp_pr, penalty")
+    se_pr, sp_pr = default_accuracy_priors(ACC_BETA)
+    return logposterior_grad!(g, theta, data, layout, se_pr, sp_pr, penalty, nothing)
+end
+
+# Back-compatible entry point for callers holding raw Beta (a,b) pairs.
+function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
+                            data::HMMData, layout::ParamLayout,
+                            se_ab::NTuple{N_TESTS,Tuple{Float64,Float64}},
+                            sp_ab::NTuple{N_TESTS,Tuple{Float64,Float64}},
+                            penalty::Bool)
+    se_pr = ntuple(k -> AccuracyPrior(ACC_BETA, se_ab[k][1], se_ab[k][2]), N_TESTS)
+    sp_pr = ntuple(k -> AccuracyPrior(ACC_BETA, sp_ab[k][1], sp_ab[k][2]), N_TESTS)
+    return logposterior_grad!(g, theta, data, layout, se_pr, sp_pr, penalty, nothing)
 end
