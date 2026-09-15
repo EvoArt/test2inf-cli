@@ -65,7 +65,8 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
                             data::HMMData, layout::ParamLayout,
                             se_pr::AccuracyPriors, sp_pr::AccuracyPriors,
                             penalty::Bool,
-                            year_weight::Union{Nothing,Vector{Float64}} = nothing)
+                            year_weight::Union{Nothing,Vector{Float64}} = nothing,
+                            jacobian::Bool = true)
     S = layout.S
     n_years = layout.n_years
     infer = layout.infer_sesp
@@ -121,13 +122,25 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
         g[layout.i_alpha + s - 1] += -z / HAZARD_PRIOR_SD
     end
 
-    # sigma_g ~ Normal+(0, sd), parameterised as log_sigma_g. The sd depends on
-    # the year process (0.05 for rw1, 0.30 for iid), matching test2infeR.
-    # d/dlog_sigma [ -sigma^2/(2 sd^2) + log_sigma ] = -sigma^2/sd^2 + 1
+    # sigma_g ~ truncated(Normal(0, sd); lower=0), parameterised as log_sigma_g.
+    # The sd depends on the year process (0.05 for rw1/rw1c, 0.30 for iid).
+    # LOG2 is the half-normal normalisation; it is constant, so it enters lp but
+    # not the gradient.
+    #
+    #   d/dlog_sigma [ -sigma^2/(2 sd^2) ]           = -sigma^2/sd^2
+    #   d/dlog_sigma [ log_sigma ]                   = 1        (the Jacobian)
+    #
+    # so the Jacobian contributes exactly the +1. Both lp and its derivative
+    # have to honour `jacobian` together, or the optimiser would descend a
+    # function it is not evaluating.
     sig_sd = sigma_prior_sd(layout.year_process)
     lp += -0.5 * (sigma_g / sig_sd)^2 - log(sig_sd) -
-          0.9189385332046727 + log_sigma
-    dlogsigma = -(sigma_g^2) / sig_sd^2 + 1.0
+          0.9189385332046727 + LOG2
+    dlogsigma = -(sigma_g^2) / sig_sd^2
+    if jacobian
+        lp += log_sigma
+        dlogsigma += 1.0
+    end
 
     # gamma_raw ~ Normal(0,1)
     @inbounds for y in 1:n_years
@@ -160,11 +173,19 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
         @inbounds for k in 1:N_TESTS
             se = Se[k]
             zse = theta[layout.i_se + k - 1]
-            lp += accuracy_logpdf_z(se_pr[k], zse, se)
+            lp += accuracy_logpdf_z(se_pr[k], zse, se, jacobian)
             if se_pr[k].family == ACC_LOGITNORMAL
-                g[layout.i_se + k - 1] += accuracy_dlogpdf_dz(se_pr[k], zse, se)
+                g[layout.i_se + k - 1] +=
+                    accuracy_dlogpdf_dz(se_pr[k], zse, se, jacobian)
             else
-                sebar[k] += se_pr[k].p / se - se_pr[k].q / (1.0 - se)
+                # WITH the Jacobian the Beta kernel and log(p)+log(1-p) combine
+                # to a*log(p) + b*log(1-p), whose p-derivative is the folded
+                # a/p - b/(1-p). WITHOUT it only the kernel remains, so the
+                # shapes lose their +1. Both are natural-scale derivatives and
+                # pick up dp/dz with everything else at the end.
+                a, b = se_pr[k].p, se_pr[k].q
+                sebar[k] += jacobian ? a / se - b / (1.0 - se) :
+                                       (a - 1.0) / se - (b - 1.0) / (1.0 - se)
             end
 
             # A pinned specificity contributes no prior term at all: the engine
@@ -173,11 +194,13 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
             if slot != 0
                 sp = Sp[k]
                 zsp = theta[slot]
-                lp += accuracy_logpdf_z(sp_pr[k], zsp, sp)
+                lp += accuracy_logpdf_z(sp_pr[k], zsp, sp, jacobian)
                 if sp_pr[k].family == ACC_LOGITNORMAL
-                    g[slot] += accuracy_dlogpdf_dz(sp_pr[k], zsp, sp)
+                    g[slot] += accuracy_dlogpdf_dz(sp_pr[k], zsp, sp, jacobian)
                 else
-                    spbar[k] += sp_pr[k].p / sp - sp_pr[k].q / (1.0 - sp)
+                    c, d = sp_pr[k].p, sp_pr[k].q
+                    spbar[k] += jacobian ? c / sp - d / (1.0 - sp) :
+                                           (c - 1.0) / sp - (d - 1.0) / (1.0 - sp)
                 end
             end
         end
@@ -537,7 +560,8 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
     layout.infer_sesp &&
         error("the short form is for the fixed-Se/Sp model; pass se_pr, sp_pr, penalty")
     se_pr, sp_pr = default_accuracy_priors(ACC_BETA)
-    return logposterior_grad!(g, theta, data, layout, se_pr, sp_pr, penalty, nothing)
+    return logposterior_grad!(g, theta, data, layout, se_pr, sp_pr, penalty,
+                              nothing, true)
 end
 
 # Back-compatible entry point for callers holding raw Beta (a,b) pairs.
@@ -548,5 +572,6 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
                             penalty::Bool)
     se_pr = ntuple(k -> AccuracyPrior(ACC_BETA, se_ab[k][1], se_ab[k][2]), N_TESTS)
     sp_pr = ntuple(k -> AccuracyPrior(ACC_BETA, sp_ab[k][1], sp_ab[k][2]), N_TESTS)
-    return logposterior_grad!(g, theta, data, layout, se_pr, sp_pr, penalty, nothing)
+    return logposterior_grad!(g, theta, data, layout, se_pr, sp_pr, penalty,
+                              nothing, true)
 end

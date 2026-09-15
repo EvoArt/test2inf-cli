@@ -57,13 +57,36 @@ OPTIONS:
   --out <dir>          Output directory                    (default: .)
   --seasons <int>      Timesteps per year                  (default: 4)
   --tests <list>       Comma-separated assay indices 1-6   (default: all)
-  --year-process <p>   rw1 | iid | rw2 | none | shrunk      (default: rw1)
+  --year-process <p>   rw1c | rw1 | iid | rw2 | none | shrunk (default: rw1c)
                        Different models, not tuning options; each carries its
-                       own sigma_g prior (rw1 0.05, rw2 0.01, shrunk 0.10,
-                       iid/none 0.30). ar1 is not supported here -- it adds a
-                       rho parameter that changes the vector layout.
+                       own sigma_g prior (rw1/rw1c 0.05, rw2 0.01, shrunk 0.10,
+                       iid/none 0.30). rw1c is rw1 constrained to sum to zero,
+                       which identifies the LEVEL of the year series -- plain
+                       rw1 leaves it free, so years with no test data drift.
+                       ar1 is not supported here: it adds a rho parameter that
+                       changes the vector layout.
+  --no-year-weight     Drop the data-adaptive increment prior (on by default).
+                       That prior shrinks each year-to-year step in proportion
+                       to how little test data informs it, so an untested year
+                       is pinned to its neighbour instead of drifting, while
+                       well-tested years are left to the likelihood.
   --infer-sesp         Estimate Se/Sp instead of fixing them at Table 1
                        (not identifiable with --tests 3 alone)
+  --accuracy-prior <f> logitnormal | beta                (default: logitnormal)
+                       Only used with --infer-sesp. Beta's shape floor at 0.5
+                       distorts the requested moments (culture Sp: asked for
+                       mean 0.999, get Beta(3.26,0.5) with mean 0.867) and makes
+                       the density diverge at the boundary, so MAP has no
+                       interior maximum and is refused. logitnormal takes each
+                       literature value as the prior MEDIAN and vanishes at both
+                       boundaries.
+  --pin-sp <k>=<v>     Pin assay k's specificity to v, leaving the others
+                       inferred. Repeatable. Requires --infer-sesp. `--pin-sp
+                       3=1.0` states that a culture positive is never a false
+                       positive -- the carry-forward assumption expressed inside
+                       the model rather than imported as a data transformation.
+                       A pinned assay is a constant: it loses its parameter slot
+                       and its prior, so the parameter count drops.
   --no-penalty         Drop the Se+Sp>1 identifiability penalty
   --repeat <mode>      stack | pool | last                 (default: stack)
   --draws <int>        NUTS post-warmup draws              (default: 1000)
@@ -74,9 +97,13 @@ OPTIONS:
   --model <name>       Pre-tuned HMC step size, trajectory length and dense
                        mass matrix. One of: all_fixed, all_inferred,
                        culture_only_fixed, no_dpp_fixed, no_dpp_inferred.
-                       Tuned for the badger cohort; only the parameter count is
-                       checked, so other data samples badly rather than
-                       failing. Retune with tune/tune_hmc.jl, or use --metric.
+                       These were tuned on rw1 with Beta priors and NO increment
+                       prior, so they do not match the current defaults: use
+                       them only with --year-process rw1 --no-year-weight
+                       (and --accuracy-prior beta when inferring). The binary
+                       refuses the mismatched combinations rather than sampling
+                       badly in silence. Retune with tune/tune_hmc.jl, or use
+                       --metric.
   --hmc-eps <float>    Override the pre-tuned step size
   --hmc-L <int>        Override the pre-tuned trajectory length
   --metric <path>      Inverse mass matrix from a headerless CSV, overriding
@@ -123,6 +150,9 @@ struct Options
     model::String        # pre-tuned HMC parameter set, "" if unset
     hmc_eps::Float64     # <=0 means "use the pre-tuned value"
     hmc_L::Int           # <=0 means "use the pre-tuned value"
+    accuracy_prior::Int  # ACC_BETA or ACC_LOGITNORMAL
+    year_weight::Bool    # data-adaptive year-increment prior
+    sp_pin::NTuple{N_TESTS,Float64}   # NaN = infer, otherwise pin to this value
 end
 
 function parse_int(s::AbstractString, name::AbstractString)
@@ -143,8 +173,19 @@ function parse_args(args::Vector{String})
     out = "."
     seasons = 4
     tests = fill(true, N_TESTS)
+    # Fixed Se/Sp is the default model: it is the main comparator in the
+    # current analysis, and inferring accuracy is the assumption check rather
+    # than the headline fit.
     infer_sesp = false
-    year_process = PROC_RW1
+    # rw1c + the data-adaptive increment prior is the current year model. Plain
+    # rw1 left the level unidentified, which put 1976-77 -- 54 tested captures
+    # and zero positives -- at the two highest hazards in the series.
+    year_process = PROC_RW1C
+    year_weight = true
+    # Logit-normal accuracy priors. Beta's shape floor at 0.5 distorts the
+    # requested moments and makes MAP unbounded at the boundary.
+    accuracy_prior = ACC_LOGITNORMAL
+    sp_pin = NO_SP_PIN
     penalty = true
     repeat_captures = :stack
     draws = 1000
@@ -187,6 +228,8 @@ function parse_args(args::Vector{String})
             yp = args[i]
             if yp == "rw1"
                 year_process = PROC_RW1
+            elseif yp == "rw1c"
+                year_process = PROC_RW1C
             elseif yp == "iid"
                 year_process = PROC_IID
             elseif yp == "rw2"
@@ -200,10 +243,35 @@ function parse_args(args::Vector{String})
                       "parameter, which changes the parameter vector layout. " *
                       "Use test2infeR's JIT engine for ar1.")
             else
-                error("--year-process must be one of: rw1, iid, rw2, none, shrunk")
+                error("--year-process must be one of: rw1c, rw1, iid, rw2, none, shrunk")
             end
         elseif a == "--infer-sesp"
             infer_sesp = true
+        elseif a == "--accuracy-prior"
+            i += 1; i <= n || error("--accuracy-prior needs a value")
+            ap = args[i]
+            if ap == "logitnormal"
+                accuracy_prior = ACC_LOGITNORMAL
+            elseif ap == "beta"
+                accuracy_prior = ACC_BETA
+            else
+                error("--accuracy-prior must be logitnormal or beta")
+            end
+        elseif a == "--no-year-weight"
+            year_weight = false
+        elseif a == "--pin-sp"
+            # "<index>=<value>", repeatable. Pins one test's specificity to a
+            # constant: culture Sp=1 is the carry-forward assumption expressed
+            # inside the model rather than imported as a data transformation.
+            i += 1; i <= n || error("--pin-sp needs a value")
+            spec = args[i]
+            eq = findfirst('=', spec)
+            eq === nothing && error("--pin-sp expects <index>=<value>, got \"$spec\"")
+            k = parse_int(spec[1:(eq - 1)], "pin-sp index")
+            (1 <= k <= N_TESTS) || error("--pin-sp index $k out of range 1..$N_TESTS")
+            v = parse_float(spec[(eq + 1):end], "pin-sp value")
+            (0.0 < v <= 1.0) || error("--pin-sp value must be in (0, 1], got $v")
+            sp_pin = ntuple(j -> j == k ? v : sp_pin[j], N_TESTS)
         elseif a == "--no-penalty"
             penalty = false
         elseif a == "--repeat"
@@ -254,15 +322,23 @@ function parse_args(args::Vector{String})
     if method == "hmc" && isempty(model) && (hmc_eps <= 0.0 || hmc_L <= 0)
         error("--method hmc needs --model (or both --hmc-eps and --hmc-L)")
     end
+    # Pinning a specificity only means something when Se/Sp are being inferred:
+    # with them fixed every Sp is already a constant, so a pin would silently do
+    # nothing. Say so rather than accept a flag that has no effect.
+    if any(!isnan, sp_pin) && !infer_sesp
+        error("--pin-sp requires --infer-sesp: with fixed Se/Sp every " *
+              "specificity is already a constant, so pinning one changes nothing.")
+    end
     return Options(data, method, out, seasons, tests, infer_sesp, penalty,
                    repeat_captures, draws, warmup, accept, seed, maxiter,
                    year_process, traj_draws, metric, write_metric_path,
-                   model, hmc_eps, hmc_L)
+                   model, hmc_eps, hmc_L, accuracy_prior, year_weight, sp_pin)
 end
 
 "Name of a year process, for reporting."
 function year_process_name(proc::Int)
     proc == PROC_RW1    && return "rw1"
+    proc == PROC_RW1C   && return "rw1c"
     proc == PROC_RW2    && return "rw2"
     proc == PROC_NONE   && return "none"
     proc == PROC_SHRUNK && return "shrunk"
@@ -541,23 +617,66 @@ function write_outputs(opts::Options, data::HMMData, layout::ParamLayout,
 end
 
 """
-    grad!(g, logp, x, data, layout, se_ab, sp_ab, penalty)
+    year_weights(mat, n_years, S) -> Vector{Float64}
+
+Number of TESTED captures in each year, for the data-adaptive increment prior.
+
+Counted over the RAW INPUT ROWS, not over gridded captures. The distinction is
+not cosmetic: `build_data` expands each badger onto the full timestep grid and
+stacks repeat captures within a timestep, so a year's gridded-capture count and
+its row count differ wherever a badger was caught twice in one quarter. On the
+real cohort that is 15,863 tested rows against 14,571 tested gridded captures.
+Rows are what the reference engine counts, and the prior's whole purpose is to
+express how much TEST EVIDENCE informs each year -- which is a property of the
+results recorded, not of how they were later packed onto a grid.
+
+Years are indexed exactly as the model indexes them, `year_of(t) = (t-1) div S
++ 1`. `ceil(t/S)` disagrees on every multiple of `S` and would misalign the
+prior by one year -- silently, since both produce a plausible-looking vector.
+"""
+function year_weights(mat::Matrix{Float64}, test_mask::Vector{Bool},
+                      n_years::Int, S::Int)
+    yw = zeros(Float64, n_years)
+    test_cols = (size(mat, 2) - 5):size(mat, 2)
+    @inbounds for r in axes(mat, 1)
+        # A capture with no test results tells the year effect nothing, so it
+        # must not count toward how well that year is informed. Masked-out
+        # assays are not results either: under `--tests 3` a row carrying only
+        # an ELISA is untested as far as this fit is concerned.
+        tested = false
+        for (j, c) in enumerate(test_cols)
+            test_mask[j] || continue
+            isnan(mat[r, c]) || (tested = true)
+        end
+        tested || continue
+        y = year_of(Int(mat[r, 1]), S)
+        y <= n_years && (yw[y] += 1.0)
+    end
+    return yw
+end
+
+"""
+    grad!(g, logp, x, data, layout, se_pr, sp_pr, penalty, year_weight)
 
 Gradient of the log posterior, by the exact reverse sweep in grad_analytic.jl.
-One pass gets every partial at ~2x the cost of a single logp, against forward
-mode's ~4.1x at 13 parameters and ~7.9x at 25 -- and unlike forward mode that
-ratio does not grow with the parameter count.
+One pass gets every partial at ~1.5-1.8x the cost of a single logp, against
+forward mode's ~4.2x and a general reverse-mode tape's ~2.8x at this parameter
+count -- and unlike forward mode that ratio does not grow with the parameter
+count.
 
-All five `sql e2e` variants are covered: any test mask, Se/Sp fixed or
-inferred. `logp` is retained only as the fallback the tests differentiate
-against; it is no longer on the sampling path.
+Covers every variant the CLI exposes: any test mask, Se/Sp fixed or inferred,
+either accuracy prior family, any year process, with or without the increment
+prior, and with any subset of specificities pinned. `logp` is retained only as
+the fallback the tests differentiate against; it is not on the sampling path.
 """
 @inline function grad!(g::Vector{Float64}, logp::L, x::Vector{Float64},
                        data::HMMData, layout::ParamLayout,
-                       se_ab::NTuple{N_TESTS,Tuple{Float64,Float64}},
-                       sp_ab::NTuple{N_TESTS,Tuple{Float64,Float64}},
-                       penalty::Bool) where {L}
-    return logposterior_grad!(g, x, data, layout, se_ab, sp_ab, penalty)
+                       se_pr::AccuracyPriors, sp_pr::AccuracyPriors,
+                       penalty::Bool,
+                       year_weight::Union{Nothing,Vector{Float64}} = nothing,
+                       jacobian::Bool = true) where {L}
+    return logposterior_grad!(g, x, data, layout, se_pr, sp_pr, penalty,
+                              year_weight, jacobian)
 end
 
 # --- method drivers --------------------------------------------------------
@@ -580,12 +699,15 @@ end
 
 function run_nuts(opts::Options, data::HMMData, layout::ParamLayout,
                   logp::L, negf!::F,
-                  se_ab::NTuple{N_TESTS,Tuple{Float64,Float64}},
-                  sp_ab::NTuple{N_TESTS,Tuple{Float64,Float64}},
-                  pen::Bool) where {L,F}
+                  se_pr::AccuracyPriors, sp_pr::AccuracyPriors,
+                  pen::Bool,
+                  yw::Union{Nothing,Vector{Float64}} = nothing) where {L,F}
+    # WITH the Jacobian: this is the unconstrained density the sampler must
+    # explore. `negf!` below deliberately omits it, but that is only used to
+    # find a starting point, never to sample.
     gradf! = let logp = logp, data = data, layout = layout,
-                 se_ab = se_ab, sp_ab = sp_ab, pen = pen
-        (g, x) -> grad!(g, logp, x, data, layout, se_ab, sp_ab, pen)
+                 se_pr = se_pr, sp_pr = sp_pr, pen = pen, yw = yw
+        (g, x) -> grad!(g, logp, x, data, layout, se_pr, sp_pr, pen, yw, true)
     end
 
     # Start from the MAP: a short optimise first makes warmup far cheaper.
@@ -690,12 +812,14 @@ end
 
 function run_hmc(opts::Options, data::HMMData, layout::ParamLayout,
                  logp::L, negf!::F,
-                 se_ab::NTuple{N_TESTS,Tuple{Float64,Float64}},
-                 sp_ab::NTuple{N_TESTS,Tuple{Float64,Float64}},
-                 pen::Bool) where {L,F}
+                 se_pr::AccuracyPriors, sp_pr::AccuracyPriors,
+                 pen::Bool,
+                 yw::Union{Nothing,Vector{Float64}} = nothing) where {L,F}
+    # WITH the Jacobian, as for NUTS: the sampler explores the unconstrained
+    # density, and omitting it would target a different posterior.
     gradf! = let logp = logp, data = data, layout = layout,
-                 se_ab = se_ab, sp_ab = sp_ab, pen = pen
-        (g, x) -> grad!(g, logp, x, data, layout, se_ab, sp_ab, pen)
+                 se_pr = se_pr, sp_pr = sp_pr, pen = pen, yw = yw
+        (g, x) -> grad!(g, logp, x, data, layout, se_pr, sp_pr, pen, yw, true)
     end
 
     # Metric precedence, highest first:
@@ -738,10 +862,29 @@ function run_hmc(opts::Options, data::HMMData, layout::ParamLayout,
         # applying the wrong set samples badly rather than failing.
         pt.year_process == layout.year_process ||
             error("--model " * pt.name * " was tuned for year process " *
-                  (pt.year_process == PROC_RW1 ? "rw1" : "iid") *
+                  year_process_name(pt.year_process) *
                   " but this run uses " *
-                  (layout.year_process == PROC_RW1 ? "rw1" : "iid") *
+                  year_process_name(layout.year_process) *
                   "; retune with tune/tune_hmc.jl or pass --year-process to match")
+        # The stored sets predate the increment prior and the logit-normal
+        # accuracy priors, and both reshape the posterior the metric describes:
+        # the increment prior tightens exactly the year-to-year directions the
+        # dense metric was built to absorb. A mis-matched metric does not fail,
+        # it samples badly and quietly, so refuse instead of warning.
+        opts.year_weight &&
+            error("--model " * pt.name * " was tuned WITHOUT the data-adaptive " *
+                  "increment prior, which changes the very year-to-year " *
+                  "correlations its dense metric encodes. Pass --no-year-weight " *
+                  "to match the tuning, or retune with tune/tune_hmc.jl.")
+        opts.infer_sesp && opts.accuracy_prior != ACC_BETA &&
+            error("--model " * pt.name * " was tuned with Beta accuracy priors " *
+                  "but this run uses logit-normal ones, which changes the " *
+                  "geometry in the Se/Sp directions. Pass --accuracy-prior beta " *
+                  "to match the tuning, or retune with tune/tune_hmc.jl.")
+        any(!isnan, opts.sp_pin) &&
+            error("--model " * pt.name * " was tuned with every specificity " *
+                  "free; pinning one removes a parameter and invalidates the " *
+                  "stored metric. Retune with tune/tune_hmc.jl.")
         if pt.n == layout.n
             inv_mass = pt.inv_mass
             opts.hmc_eps > 0.0 || (eps = pt.eps)
@@ -821,27 +964,67 @@ function run(args::Vector{String})
 
     mat = read_matrix(opts.data)
     data = build_data(mat, opts.tests, opts.repeat_captures, opts.seasons)
-    layout = ParamLayout(data.S, data.n_years, opts.infer_sesp, opts.year_process)
-    se_ab, sp_ab = default_sesp_priors()
+    layout = ParamLayout(data.S, data.n_years, opts.infer_sesp, opts.year_process,
+                         opts.sp_pin)
+    se_pr, sp_pr = default_accuracy_priors(opts.accuracy_prior)
+    yw = opts.year_weight ?
+         year_weights(mat, opts.tests, data.n_years, data.S) : nothing
+
+    # MAP on a prior whose density diverges at a probability boundary has no
+    # interior maximum, so whatever the optimiser stops at is not a MAP
+    # estimate. Refuse rather than report it. Pinned tests are excluded: they
+    # are constants and carry no prior.
+    if opts.method == "map" && opts.infer_sesp
+        bad = false
+        for k in 1:N_TESTS
+            is_singular_at_boundary(se_pr[k]) && (bad = true)
+            layout.sp_slot[k] != 0 && is_singular_at_boundary(sp_pr[k]) && (bad = true)
+        end
+        bad && error("MAP refused: a free Beta prior has a singular boundary " *
+                     "density, so there is no interior maximum and an optimiser " *
+                     "result is not a certified MAP. Use --accuracy-prior " *
+                     "logitnormal, posterior sampling, or fixed Se/Sp.")
+    end
 
     println(Core.stdout, "badgers: ", data.n_ind,
             "  captures: ", length(data.times),
             "  years: ", data.n_years,
             "  parameters: ", layout.n,
             "  year process: ",
-            year_process_name(layout.year_process))
+            year_process_name(layout.year_process),
+            opts.year_weight ? "+yw" : "")
 
+    # MAP and sampling maximise DIFFERENT functions, and deliberately so.
+    #
+    # MAP asks "where is the density highest?", which has no
+    # parameterisation-free answer: the mode in sigma is not the image of the
+    # mode in log sigma, because the change of variables reweights by the
+    # Jacobian. Turing's `maximum_a_posteriori` answers it on the CONSTRAINED
+    # scale, so this does too -- otherwise the same data would give a different
+    # sigma here than in the reference engine.
+    #
+    # Sampling asks "draw from the posterior", which IS
+    # parameterisation-free. The sampler works unconstrained, and the Jacobian
+    # is exactly what makes the unconstrained density represent the same
+    # distribution. Dropping it there would sample a different posterior, so it
+    # is not optional.
+    #
+    # Hence one objective, one flag, and both the primal and its gradient must
+    # carry the same value of it -- a mismatch would have L-BFGS descending a
+    # function it is not evaluating.
+    #
     # Closures over the fixed data; concrete-typed so trim can trace them.
-    logp = let data = data, layout = layout, se_ab = se_ab, sp_ab = sp_ab,
-               pen = opts.penalty
-        theta -> logposterior(theta, data, layout, se_ab, sp_ab, pen)
+    logp = let data = data, layout = layout, se_pr = se_pr, sp_pr = sp_pr,
+               pen = opts.penalty, yw = yw
+        theta -> logposterior(theta, data, layout, se_pr, sp_pr, pen, yw, true)
     end
 
-    # Negative log posterior + gradient, for the minimiser.
+    # Negative log posterior + gradient, for the minimiser. No Jacobian: this
+    # is only ever handed to L-BFGS, for MAP and for the sampler's MAP init.
     negf! = let logp = logp, data = data, layout = layout,
-                se_ab = se_ab, sp_ab = sp_ab, pen = opts.penalty
+                se_pr = se_pr, sp_pr = sp_pr, pen = opts.penalty, yw = yw
         (g, x) -> begin
-            fx = grad!(g, logp, x, data, layout, se_ab, sp_ab, pen)
+            fx = grad!(g, logp, x, data, layout, se_pr, sp_pr, pen, yw, false)
             @inbounds for i in eachindex(g)
                 g[i] = -g[i]
             end
@@ -856,9 +1039,9 @@ function run(args::Vector{String})
     if opts.method == "map"
         run_map(opts, data, layout, negf!)
     elseif opts.method == "hmc"
-        run_hmc(opts, data, layout, logp, negf!, se_ab, sp_ab, opts.penalty)
+        run_hmc(opts, data, layout, logp, negf!, se_pr, sp_pr, opts.penalty, yw)
     else
-        run_nuts(opts, data, layout, logp, negf!, se_ab, sp_ab, opts.penalty)
+        run_nuts(opts, data, layout, logp, negf!, se_pr, sp_pr, opts.penalty, yw)
     end
 
     println(Core.stdout, "wrote outputs to ", opts.out)

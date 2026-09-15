@@ -15,6 +15,7 @@ const HAZARD_PRIOR_MEAN = -3.0
 const HAZARD_PRIOR_SD   = 1.5
 const PENALTY_WEIGHT    = 50.0
 const PENALTY_SCALE     = 0.02
+const LOG2              = 0.6931471805599453
 
 # Data-adaptive year-increment prior (`year_weight`). The rw1 increments are
 # unidentified wherever there is no test data, so the walk drifts freely there --
@@ -405,33 +406,49 @@ end
 const AccuracyPriors = NTuple{N_TESTS,AccuracyPrior}
 
 """
-Log density of one accuracy prior, as a function of the UNCONSTRAINED
-parameter `z = logit(p)`, including any transform Jacobian.
+Log density of one accuracy prior at `p = logistic(z)`.
 
-  Beta:        beta_logpdf_kernel(p,a,b) + log(p) + log(1-p)
-  LogitNormal: normal_logpdf(z, mu, sd)   -- the Jacobian cancels exactly,
-               verified against Distributions.jl to 1.1e-13.
+With `jacobian = true` this is the density in the UNCONSTRAINED space (what a
+sampler needs); with `jacobian = false` it is the density on the probability
+scale (what Turing's MAP maximises).
+
+  Beta:        beta_logpdf_kernel(p,a,b)  [+ log(p) + log(1-p)]
+  LogitNormal: logpdf(LogitNormal, p)     [+ log(p) + log(1-p)]
+               and those two together are exactly normal_logpdf(z, mu, sd),
+               since the Jacobian cancels the LogitNormal's own 1/(p(1-p))
+               factor -- verified against Distributions.jl to 1.1e-13. So the
+               unconstrained form is the cheap one and the CONSTRAINED form is
+               the one that has to subtract the Jacobian back off.
 """
-@inline function accuracy_logpdf_z(pr::AccuracyPrior, z::T, p::T) where {T}
+@inline function accuracy_logpdf_z(pr::AccuracyPrior, z::T, p::T,
+                                   jacobian::Bool = true) where {T}
+    logjac = log(p) + log(one(T) - p)
     if pr.family == ACC_LOGITNORMAL
-        return normal_logpdf(z, pr.p, pr.q)
+        lp = normal_logpdf(z, pr.p, pr.q)
+        return jacobian ? lp : lp - logjac
     end
-    return beta_logpdf_kernel(p, pr.p, pr.q) + log(p) + log(one(T) - p)
+    lp = beta_logpdf_kernel(p, pr.p, pr.q)
+    return jacobian ? lp + logjac : lp
 end
 
 """
-d(log prior)/dz for one accuracy parameter.
+d(log prior)/dz for one accuracy parameter, matching `accuracy_logpdf_z`.
 
-  LogitNormal: -(z - mu)/sd^2
-  Beta:        ((a-1)/p - (b-1)/(1-p)) * p(1-p) + (1 - 2p)
-               where p(1-p) is dp/dz and (1-2p) is d/dz of the Jacobian term.
+  LogitNormal: -(z - mu)/sd^2                       [- (1 - 2p) without J]
+  Beta:        ((a-1)/p - (b-1)/(1-p)) * p(1-p)     [+ (1 - 2p) with J]
+
+where p(1-p) is dp/dz and (1-2p) is d/dz of the Jacobian term log(p)+log(1-p).
 """
-@inline function accuracy_dlogpdf_dz(pr::AccuracyPrior, z::Float64, p::Float64)
+@inline function accuracy_dlogpdf_dz(pr::AccuracyPrior, z::Float64, p::Float64,
+                                     jacobian::Bool = true)
+    dlogjac = 1.0 - 2.0 * p
     if pr.family == ACC_LOGITNORMAL
-        return -(z - pr.p) / (pr.q * pr.q)
+        d = -(z - pr.p) / (pr.q * pr.q)
+        return jacobian ? d : d - dlogjac
     end
     dp = p * (1.0 - p)
-    return ((pr.p - 1.0) / p - (pr.q - 1.0) / (1.0 - p)) * dp + (1.0 - 2.0 * p)
+    d = ((pr.p - 1.0) / p - (pr.q - 1.0) / (1.0 - p)) * dp
+    return jacobian ? d + dlogjac : d
 end
 
 """
@@ -456,7 +473,8 @@ the dual-number gradient runs through the identical code path.
 function logposterior(theta::AbstractVector{T}, data::HMMData, layout::ParamLayout,
                       se_pr::AccuracyPriors, sp_pr::AccuracyPriors,
                       penalty::Bool,
-                      year_weight::Union{Nothing,Vector{Float64}} = nothing) where {T}
+                      year_weight::Union{Nothing,Vector{Float64}} = nothing,
+                      jacobian::Bool = true) where {T}
     S = layout.S
     n_years = layout.n_years
     lp = zero(T)
@@ -468,10 +486,18 @@ function logposterior(theta::AbstractVector{T}, data::HMMData, layout::ParamLayo
         lp = lp + normal_logpdf(alpha[s], HAZARD_PRIOR_MEAN, HAZARD_PRIOR_SD)
     end
 
-    # sigma_g ~ Normal+(0, sd), stored as log_sigma_g; + log|J| = log_sigma_g
+    # sigma_g ~ truncated(Normal(0, sd); lower=0), stored as log_sigma_g.
+    #
+    # LOG2 because the prior is a HALF normal: truncating to the positive half
+    # line doubles the density there, so its log density is the full normal's
+    # plus log(2). Dropping it would be harmless for optimisation but makes log
+    # densities incomparable with the reference engine's.
     log_sigma = theta[layout.i_logsigma]
     sigma_g = exp(log_sigma)
-    lp = lp + normal_logpdf(sigma_g, 0.0, sigma_prior_sd(layout.year_process)) + log_sigma
+    lp = lp + normal_logpdf(sigma_g, 0.0, sigma_prior_sd(layout.year_process)) + LOG2
+    # + log|J| for the log transform. See `jacobian` in the docstring: sampling
+    # needs it, Turing's MAP does not include it.
+    jacobian && (lp = lp + log_sigma)
 
     # gamma_raw ~ Normal(0,1), then the process maps raw to the year effects.
     gamma = Vector{T}(undef, n_years)
@@ -504,7 +530,7 @@ function logposterior(theta::AbstractVector{T}, data::HMMData, layout::ParamLayo
             zse = theta[layout.i_se + k - 1]
             se = logistic(zse)
             Se[k] = se
-            lp = lp + accuracy_logpdf_z(se_pr[k], zse, se)
+            lp = lp + accuracy_logpdf_z(se_pr[k], zse, se, jacobian)
 
             slot = layout.sp_slot[k]
             if slot == 0
@@ -513,7 +539,7 @@ function logposterior(theta::AbstractVector{T}, data::HMMData, layout::ParamLayo
                 zsp = theta[slot]
                 sp = logistic(zsp)
                 Sp[k] = sp
-                lp = lp + accuracy_logpdf_z(sp_pr[k], zsp, sp)
+                lp = lp + accuracy_logpdf_z(sp_pr[k], zsp, sp, jacobian)
             end
         end
     else
@@ -559,7 +585,7 @@ function logposterior(theta::AbstractVector{T}, data::HMMData, layout::ParamLayo
                       penalty::Bool) where {T}
     se_pr = ntuple(k -> AccuracyPrior(ACC_BETA, se_ab[k][1], se_ab[k][2]), N_TESTS)
     sp_pr = ntuple(k -> AccuracyPrior(ACC_BETA, sp_ab[k][1], sp_ab[k][2]), N_TESTS)
-    return logposterior(theta, data, layout, se_pr, sp_pr, penalty, nothing)
+    return logposterior(theta, data, layout, se_pr, sp_pr, penalty, nothing, true)
 end
 
 # --- parameter extraction --------------------------------------------------
