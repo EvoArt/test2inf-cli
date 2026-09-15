@@ -50,20 +50,26 @@ REQUIRED:
   --data <path>        Input CSV: time,id,captured,test1..test6 (header row)
 
 OPTIONS:
-  --method <m>         map | nutsthenhmc | nuts | hmc      (default: map)
+  --method <m>         map | nuts | nutsthenhmc | hmc      (default: map)
                        map         point estimate by L-BFGS, maximising the
                                    CONSTRAINED-space density, as Turing's
                                    maximum_a_posteriori does.
-                       nutsthenhmc the default for full posterior sampling:
-                                   NUTS adapts the step size and metric during
-                                   warmup, then fixed-L HMC draws with them,
-                                   skipping the per-draw tree building. L comes
-                                   from NUTS's mean tree depth unless --hmc-L
-                                   overrides it. Needs no pre-tuned constants.
-                       nuts        pure NUTS throughout; the safest and the one
-                                   to compare against when a sampler looks off.
-                       hmc         fixed-L HMC with a compiled-in DENSE metric;
-                                   fastest by far, but needs --model and is
+                       nuts        the default for full posterior sampling.
+                                   Measured on the real cohort at 1000 draws
+                                   after 1000 warmup: 142 s, min ESS 843 of
+                                   1000, 5.9 min-ESS/second.
+                       nutsthenhmc NUTS adapts, then jittered-L HMC draws with
+                                   the adapted step size and metric. 30%
+                                   quicker per iteration but the draws are far
+                                   more correlated -- min ESS 46 against nuts's
+                                   843 on the same budget, i.e. about a
+                                   thirteenth the effective draws per second.
+                                   Acceptance and divergences look healthy
+                                   throughout, so that is not detectable
+                                   without measuring ESS. Kept as a fallback
+                                   and for comparison; check ESS if you use it.
+                       hmc         fixed-L HMC with a supplied metric; needs
+                                   --model or --metric, and a pre-tuned set is
                                    only valid for the data it was tuned on.
   --out <dir>          Output directory                    (default: .)
   --seasons <int>      Timesteps per year                  (default: 4)
@@ -343,8 +349,15 @@ function parse_args(args::Vector{String})
     method in ("map", "nuts", "hmc", "nutsthenhmc") ||
         error("--method must be map, nutsthenhmc, nuts or hmc")
     any(tests) || error("--tests selected no assays")
+    # Fixed-L HMC adapts nothing, so a step size, a trajectory length and a
+    # metric must all come from somewhere. --model supplies all three; --metric
+    # supplies only the metric, so it still needs --hmc-eps and --hmc-L beside
+    # it. Saying which one is missing beats a blanket "needs --model".
     if method == "hmc" && isempty(model) && (hmc_eps <= 0.0 || hmc_L <= 0)
-        error("--method hmc needs --model (or both --hmc-eps and --hmc-L)")
+        error("--method hmc adapts nothing, so it needs a step size and a " *
+              "trajectory length as well as a metric: pass --model, or pass " *
+              "--hmc-eps and --hmc-L (with --metric for the mass matrix). " *
+              "--method nutsthenhmc adapts all three itself.")
     end
     return Options(data, method, out, seasons, tests, infer_sesp, penalty,
                    repeat_captures, draws, warmup, accept, seed, maxiter,

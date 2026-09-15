@@ -97,6 +97,69 @@ end
 
 reset!(w::WelfordVar) = (w.n = 0; fill!(w.mean, 0.0); fill!(w.m2, 0.0); w)
 
+"""
+Welford accumulator for a DENSE mass matrix.
+
+The diagonal version can only rescale axes; it cannot rotate. On this model the
+year effects are correlated with each other and with log_sigma_g, so a diagonal
+metric must step small enough for the tightest direction while the sampler is
+trying to traverse the loosest -- which is what shows up as poor mixing in
+sigma_g and alpha however healthy the acceptance rate looks.
+"""
+mutable struct WelfordCov
+    n::Int
+    mean::Vector{Float64}
+    m2::Matrix{Float64}
+end
+
+WelfordCov(d::Int) = WelfordCov(0, zeros(d), zeros(d, d))
+
+function accumulate!(w::WelfordCov, x::Vector{Float64})
+    w.n += 1
+    d = length(x)
+    # delta BEFORE the mean update, delta2 after: the product of the two is the
+    # standard online covariance update, and using the same delta twice would
+    # silently bias the result.
+    delta = Vector{Float64}(undef, d)
+    @inbounds for i in 1:d
+        delta[i] = x[i] - w.mean[i]
+        w.mean[i] += delta[i] / w.n
+    end
+    @inbounds for j in 1:d
+        dj = x[j] - w.mean[j]
+        for i in 1:d
+            w.m2[i, j] += delta[i] * dj
+        end
+    end
+    return w
+end
+
+function covariance(w::WelfordCov)
+    d = length(w.mean)
+    out = zeros(d, d)
+    if w.n > 2
+        # Stan's regularisation toward the identity. Essential here, not
+        # cosmetic: an unregularised sample covariance at n close to d is
+        # singular or nearly so, and the Cholesky factor would fail.
+        n = Float64(w.n)
+        shrink = n / (n + 5.0)
+        ridge = 1e-3 * (5.0 / (n + 5.0))
+        @inbounds for j in 1:d, i in 1:d
+            out[i, j] = shrink * (w.m2[i, j] / (n - 1.0))
+        end
+        @inbounds for i in 1:d
+            out[i, i] += ridge
+        end
+    else
+        @inbounds for i in 1:d
+            out[i, i] = 1.0
+        end
+    end
+    return out
+end
+
+reset!(w::WelfordCov) = (w.n = 0; fill!(w.mean, 0.0); fill!(w.m2, 0.0); w)
+
 # --- leapfrog --------------------------------------------------------------
 @inline function kinetic(p::Vector{Float64}, inv_mass::Vector{Float64})
     s = 0.0

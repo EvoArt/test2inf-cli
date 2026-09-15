@@ -335,17 +335,30 @@ step size and metric, which skips the tree building NUTS pays on every draw.
 actually took -- so the HMC phase does comparable work per draw to the NUTS
 phase, rather than a length picked out of the air.
 
-What this does and does not buy:
+**This is NOT the default sampler, and the reason is measured.** On the real
+cohort at 1000 draws after 1000 warmup, against plain `nuts` on the same budget:
 
-  * It removes tree building and the doubling procedure's rejected work. On a
-    posterior where NUTS settles at a stable depth that is most of the saving.
-  * It does NOT recover the dense metric. NUTS adapts a DIAGONAL metric, and on
-    this model the funnel from `gamma = sigma_g * cumsum(raw)` is exactly what a
-    diagonal metric cannot represent -- measured, the dense pre-tuned path steps
-    at eps ~0.29 against diagonal's ~0.047. So `--model` remains much faster
-    when a valid pre-tuned set exists; this is the fallback for when one does
-    not, and it is still safe because everything is adapted from the data in
-    front of it.
+    sampler        time    acc   div   min ESS   med ESS   min ESS/s
+    nuts           142 s   0.93    0       843      1000        5.93
+    nutsthenhmc     99 s   0.92    0        46       355        0.46
+
+30% quicker per iteration, and roughly a thirteenth of the effective draws per
+second. `sigma_g` and the seasonal intercepts are what degrade: NUTS varies its
+trajectory length per draw, and that is how it decorrelates them. A single
+fixed `L` cannot serve every direction at once, so the draws stay highly
+autocorrelated while still accepting readily.
+
+Note what that implies for diagnostics -- acceptance stays at 0.92 and there
+are no divergences, so nothing in the usual checks reveals it. Only ESS does.
+
+It also does NOT recover the dense metric. NUTS adapts a DIAGONAL one, and the
+correlation between the year effects and `log_sigma_g` is exactly what a
+diagonal metric cannot represent.
+
+Kept because it is a reasonable fallback, because it is the natural comparison
+when a sampler looks wrong, and because a posterior with a stable tree depth
+and weaker correlations may well suit it better than this one does. Check ESS
+before relying on its draws.
 
 Returns an `HMCResult` whose `step_size` and `inv_mass` are the adapted values,
 so a caller can export them with `--write-metric` and reuse them later.
