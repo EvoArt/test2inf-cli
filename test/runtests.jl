@@ -750,6 +750,47 @@ const SPARSE = joinpath(@__DIR__, "..", "testdata", "sparse.csv")
         end
     end
 
+    @testset "nuts_then_hmc agrees with pure NUTS" begin
+        # The default full-Bayes path: NUTS adapts, fixed-L HMC draws with what
+        # it learned. It must land on the same posterior as NUTS alone -- a
+        # wrong hand-off (stale metric, wrong step size, a start point outside
+        # the typical set) would still produce draws, just of the wrong thing.
+        layout = M.ParamLayout(data.S, data.n_years, false, M.PROC_RW1C)
+        logp = th -> M.logposterior(th, data, layout, se_pr_b, sp_pr_b, true)
+        gradf! = (g, x) -> M.logposterior_grad!(g, x, data, layout,
+                                                se_pr_b, sp_pr_b, true)
+        negf! = (g, x) -> begin
+            fx = gradf!(g, x)
+            @inbounds for i in eachindex(g); g[i] = -g[i]; end
+            return -fx
+        end
+        th0 = M.lbfgs(negf!, M.initial_theta(layout); maxiter = 300).theta
+
+        rn  = M.nuts(gradf!, th0, 3000, 800, 0.8, 21)
+        nth = M.nuts_then_hmc(gradf!, th0, 3000, 800, 0.8, 21)
+
+        @test nth.L >= 1
+        @test nth.result.n_divergent == 0
+        @test nth.result.accept_rate > 0.6
+        # L is inferred from the adapted tree depth, not fixed in advance.
+        @test nth.L == max(1, min(round(Int, 2.0^nth.warmup.mean_depth) - 1, 1024))
+        # It inherits the adapted values rather than re-deriving them.
+        @test nth.result.step_size == nth.warmup.step_size
+        @test nth.result.inv_mass == nth.warmup.inv_mass
+
+        nd = size(rn.draws, 2)
+        for i in 1:layout.n
+            mn = sum(view(rn.draws, i, :)) / nd
+            mh = sum(view(nth.result.draws, i, :)) / size(nth.result.draws, 2)
+            sn = sqrt(sum((rn.draws[i, k] - mn)^2 for k in 1:nd) / (nd - 1))
+            @test abs(mn - mh) < 0.35 * max(sn, 1e-6)
+        end
+
+        # An explicit L overrides the inferred one.
+        nth2 = M.nuts_then_hmc(gradf!, th0, 200, 400, 0.8, 22; n_leapfrog = 7)
+        @test nth2.L == 7
+    end
+
     @testset "per-draw trajectory outputs" begin
         # These feed 03_trajectories.R in the sql-e2e bundles: prevalence CIs
         # need each draw's prevalence, and the trajectory outputs need each

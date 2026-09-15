@@ -319,3 +319,63 @@ function hmc(gradf!::F, x0::Vector{Float64}, inv_mass::Matrix{Float64},
     return HMCResult(draws, lps, eps, L, inv_mass, n_div,
                      acc_n > 0 ? acc_sum / acc_n : 0.0)
 end
+
+# --- NUTS-then-HMC ----------------------------------------------------------
+"""
+    nuts_then_hmc(gradf!, x0, n_draws, n_warmup, delta, seed; n_leapfrog=0)
+
+Adapt with NUTS, then draw with fixed-length HMC using what NUTS learned.
+
+Warmup is NUTS, so the step size and metric are adapted from scratch and no
+pre-tuned constants are needed. Sampling is then fixed-L HMC at the adapted
+step size and metric, which skips the tree building NUTS pays on every draw.
+
+`n_leapfrog = 0` (the default) infers `L` from NUTS's mean tree depth as
+`round(2^depth) - 1`, the number of leapfrog steps an average NUTS trajectory
+actually took -- so the HMC phase does comparable work per draw to the NUTS
+phase, rather than a length picked out of the air.
+
+What this does and does not buy:
+
+  * It removes tree building and the doubling procedure's rejected work. On a
+    posterior where NUTS settles at a stable depth that is most of the saving.
+  * It does NOT recover the dense metric. NUTS adapts a DIAGONAL metric, and on
+    this model the funnel from `gamma = sigma_g * cumsum(raw)` is exactly what a
+    diagonal metric cannot represent -- measured, the dense pre-tuned path steps
+    at eps ~0.29 against diagonal's ~0.047. So `--model` remains much faster
+    when a valid pre-tuned set exists; this is the fallback for when one does
+    not, and it is still safe because everything is adapted from the data in
+    front of it.
+
+Returns an `HMCResult` whose `step_size` and `inv_mass` are the adapted values,
+so a caller can export them with `--write-metric` and reuse them later.
+"""
+function nuts_then_hmc(gradf!::F, x0::Vector{Float64}, n_draws::Int,
+                       n_warmup::Int, delta::Float64, seed::Int;
+                       n_leapfrog::Int = 0) where {F}
+    n_warmup > 0 || error("nuts_then_hmc needs a warmup phase to adapt in")
+
+    # Phase 1: NUTS, purely to adapt. Ask for one draw rather than zero -- the
+    # sampler's post-warmup bookkeeping (acceptance, divergences, tree depth) is
+    # what tells us what it settled on, and a zero-draw run reports nothing.
+    warm = nuts(gradf!, x0, 1, n_warmup, delta, seed)
+
+    L = n_leapfrog
+    if L <= 0
+        # 2^depth - 1 is the number of leapfrog steps in a full doubling to that
+        # depth. Clamped: a degenerate depth of 0 would give L=0 (no movement at
+        # all), and a runaway depth would make each draw ruinously expensive.
+        L = round(Int, 2.0^warm.mean_depth) - 1
+        L = max(1, min(L, 1024))
+    end
+
+    # Phase 2: fixed-L HMC from where NUTS finished, at its step size and
+    # metric. No further warmup: the chain is already in the typical set, which
+    # is the whole reason for adapting first.
+    x1 = warm.draws[:, 1]
+    res = hmc(gradf!, x1, warm.inv_mass, warm.step_size, L, n_draws, 0, seed + 1)
+
+    # Report the warmup phase's diagnostics too: they are what justify the step
+    # size and metric the sampling phase then takes on trust.
+    return (result = res, warmup = warm, L = L)
+end

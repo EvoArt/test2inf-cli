@@ -50,10 +50,21 @@ REQUIRED:
   --data <path>        Input CSV: time,id,captured,test1..test6 (header row)
 
 OPTIONS:
-  --method <map|nuts|hmc>
-                       Inference method                    (default: map)
-                       hmc = fixed-L HMC with a dense mass matrix; requires
-                       --model to select the pre-tuned parameters
+  --method <m>         map | nutsthenhmc | nuts | hmc      (default: map)
+                       map         point estimate by L-BFGS, maximising the
+                                   CONSTRAINED-space density, as Turing's
+                                   maximum_a_posteriori does.
+                       nutsthenhmc the default for full posterior sampling:
+                                   NUTS adapts the step size and metric during
+                                   warmup, then fixed-L HMC draws with them,
+                                   skipping the per-draw tree building. L comes
+                                   from NUTS's mean tree depth unless --hmc-L
+                                   overrides it. Needs no pre-tuned constants.
+                       nuts        pure NUTS throughout; the safest and the one
+                                   to compare against when a sampler looks off.
+                       hmc         fixed-L HMC with a compiled-in DENSE metric;
+                                   fastest by far, but needs --model and is
+                                   only valid for the data it was tuned on.
   --out <dir>          Output directory                    (default: .)
   --seasons <int>      Timesteps per year                  (default: 4)
   --tests <list>       Comma-separated assay indices 1-6   (default: all)
@@ -91,9 +102,10 @@ OPTIONS:
                        different model, not a no-op.
   --no-penalty         Drop the Se+Sp>1 identifiability penalty
   --repeat <mode>      stack | pool | last                 (default: stack)
-  --draws <int>        NUTS post-warmup draws              (default: 1000)
-  --warmup <int>       NUTS warmup iterations              (default: 1000)
-  --accept <float>     NUTS target acceptance              (default: 0.8)
+  --draws <int>        Post-warmup draws                   (default: 1000)
+  --warmup <int>       Warmup iterations                   (default: 1000)
+                       Under nutsthenhmc this is the NUTS adaptation phase.
+  --accept <float>     Target acceptance for adaptation    (default: 0.8)
   --seed <int>         RNG seed                            (default: 1)
   --maxiter <int>      L-BFGS iteration cap                (default: 1000)
   --model <name>       Pre-tuned HMC step size, trajectory length and dense
@@ -107,7 +119,8 @@ OPTIONS:
                        badly in silence. Retune with tune/tune_hmc.jl, or use
                        --metric.
   --hmc-eps <float>    Override the pre-tuned step size
-  --hmc-L <int>        Override the pre-tuned trajectory length
+  --hmc-L <int>        Override the trajectory length. Under nutsthenhmc this
+                       replaces the length inferred from NUTS's tree depth.
   --metric <path>      Inverse mass matrix from a headerless CSV, overriding
                        --model. n rows of n values, or one row/column of n
                        values for a diagonal metric.
@@ -319,7 +332,8 @@ function parse_args(args::Vector{String})
     end
 
     isempty(data) && error("--data is required")
-    method in ("map", "nuts", "hmc") || error("--method must be map, nuts or hmc")
+    method in ("map", "nuts", "hmc", "nutsthenhmc") ||
+        error("--method must be map, nutsthenhmc, nuts or hmc")
     any(tests) || error("--tests selected no assays")
     if method == "hmc" && isempty(model) && (hmc_eps <= 0.0 || hmc_L <= 0)
         error("--method hmc needs --model (or both --hmc-eps and --hmc-L)")
@@ -752,6 +766,68 @@ function run_nuts(opts::Options, data::HMMData, layout::ParamLayout,
     return nothing
 end
 
+function run_nutsthenhmc(opts::Options, data::HMMData, layout::ParamLayout,
+                         logp::L, negf!::F,
+                         se_pr::AccuracyPriors, sp_pr::AccuracyPriors,
+                         pen::Bool,
+                         yw::Union{Nothing,Vector{Float64}} = nothing) where {L,F}
+    # WITH the Jacobian: both phases sample the unconstrained density.
+    gradf! = let logp = logp, data = data, layout = layout,
+                 se_pr = se_pr, sp_pr = sp_pr, pen = pen, yw = yw
+        (g, x) -> grad!(g, logp, x, data, layout, se_pr, sp_pr, pen, yw, true)
+    end
+
+    theta0 = initial_theta(layout)
+    opt = lbfgs(negf!, theta0; maxiter = 200)
+    println(Core.stdout, "MAP init: log posterior ", opt.logp)
+
+    nth = nuts_then_hmc(gradf!, opt.theta, opts.draws, opts.warmup,
+                        opts.accept, opts.seed;
+                        n_leapfrog = opts.hmc_L > 0 ? opts.hmc_L : 0)
+    warm = nth.warmup
+    res = nth.result
+
+    println(Core.stdout, "warmup (NUTS): step size ", warm.step_size,
+            "  mean tree depth ", warm.mean_depth,
+            "  divergences ", warm.n_divergent_warmup,
+            "  mean accept ", warm.accept_rate_warmup)
+    println(Core.stdout, "sampling (HMC): L ", nth.L,
+            "  divergences ", res.n_divergent,
+            "  mean accept ", res.accept_rate)
+    if res.n_divergent > 0
+        println(Core.stdout,
+                "WARNING: ", res.n_divergent,
+                " post-warmup divergences -- draws may be biased.")
+    end
+    # An acceptance rate far from the target means the inherited step size does
+    # not suit a FIXED trajectory: NUTS can compensate by varying its tree
+    # depth, and fixed-L HMC cannot. Worth saying, because the draws are still
+    # produced either way.
+    if res.accept_rate < 0.6 || res.accept_rate > 0.99
+        println(Core.stdout,
+                "WARNING: HMC acceptance ", res.accept_rate,
+                " is far from the target ", opts.accept,
+                " -- the step size NUTS adapted may not suit a fixed L. ",
+                "Compare against --method nuts before trusting these draws.")
+    end
+
+    # The adapted metric is worth keeping: it is what turns a later run into the
+    # cheap pre-tuned path without any rebuild.
+    if !isempty(opts.write_metric)
+        d = length(warm.inv_mass)
+        m = zeros(d, d)
+        for i in 1:d
+            m[i, i] = warm.inv_mass[i]
+        end
+        write_metric(opts.write_metric, m)
+        println(Core.stdout, "wrote metric to ", opts.write_metric,
+                "  (step size ", warm.step_size, ", L ", nth.L, ")")
+    end
+
+    finish_draws(opts, data, layout, res.draws)
+    return nothing
+end
+
 """
 Posterior summaries from a matrix of draws, shared by the NUTS and HMC paths:
 per-parameter mean and sd, the posterior mean of P(infected), and draws.csv.
@@ -1043,6 +1119,9 @@ function run(args::Vector{String})
         run_map(opts, data, layout, negf!)
     elseif opts.method == "hmc"
         run_hmc(opts, data, layout, logp, negf!, se_pr, sp_pr, opts.penalty, yw)
+    elseif opts.method == "nutsthenhmc"
+        run_nutsthenhmc(opts, data, layout, logp, negf!, se_pr, sp_pr,
+                        opts.penalty, yw)
     else
         run_nuts(opts, data, layout, logp, negf!, se_pr, sp_pr, opts.penalty, yw)
     end
