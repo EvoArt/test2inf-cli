@@ -54,6 +54,12 @@ and last capture either way.
 | `--warmup <int>` | warmup iterations | 1000 |
 | `--accept <float>` | NUTS target acceptance | 0.8 |
 | `--traj-draws <int>` | draws for per-draw outputs | 0 |
+| `--traj-mode <threshold\|sample>` | infection time per draw: first crossing of P = 0.5, or a sampled state path | `threshold` |
+| `--states <2\|3>` | 2: uninfected → infected. 3: uninfected → exposed → infectious | 2 |
+| `--e-mult <k>=<v>` | fix assay k's exposed-state multiplier instead of estimating it; repeatable | all estimated |
+| `--birth <path>` | CSV `id,birth`: those badgers start susceptible at their birth timestep | none |
+| `--init-starts <n>` | optimise from n starts and begin from the best optimum; the same for every seed | 1 |
+| `--init-jitter <sd>` | seeded perturbation of the starting point, so chains start apart | 0 |
 | `--metric <path>` | inverse mass matrix CSV | |
 | `--write-metric <path>` | export the metric used | |
 | `--hmc-eps <float>` | override tuned step size | |
@@ -75,6 +81,27 @@ and last capture either way.
 | `draws.csv` | posterior draws (`nuts`/`hmc`) |
 | `prevalence_draws.csv` | `time` + one column per draw (`--traj-draws`) |
 | `trajectories.csv` | `id, draw, infection_time`, 0 = never (`--traj-draws`) |
+
+With `--states 3`, `p_infected` is P(exposed or infectious) and the file gains
+`p_exposed` and `p_infectious`; `prevalence.csv` gains `prevalence_infectious`;
+`trajectories.csv` gains `infectious_time`; and
+`prevalence_infectious_draws.csv` is written beside `prevalence_draws.csv`.
+
+## Three states
+
+`--states 3` splits infected into exposed (E) and infectious (I). U -> E uses
+the same seasonal/yearly hazard as before, E -> I has a constant per-timestep
+hazard `tau`, and I is absorbing. `rho` is the share of badgers infected at
+first capture that are already infectious.
+
+Each assay has a multiplier on its sensitivity for exposed badgers,
+`P(+ | exposed) = e_mult[k] * Se[k]`, with a Uniform(0, 1) prior. `--e-mult`
+pins one. With all six at 1 the likelihood is the two-state one.
+
+The posterior can be multimodal with free multipliers. `--init-jitter 1` starts
+chains apart so this shows up in Rhat; `--init-starts 8` starts every chain
+from the best of eight optimiser runs. `--birth` helps a lot on the Woodchester
+data.
 
 ## Metrics
 

@@ -267,6 +267,62 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
         lo = i == 1 ? 1 : data.seq_ends[i - 1] + 1
         nmax = max(nmax, data.seq_ends[i] - lo + 1)
     end
+    # --- three-state model: tau, rho, multipliers ---------------------------
+    # tau and rho are clamped like the other probabilities (zero derivative
+    # when clamped). LogitNormal prior derivatives are on the logit scale so
+    # they go straight into `g`.
+    sei = layout.sei
+    tau = 0.0
+    rho = 0.0
+    dtau_dz = 0.0
+    drho_dz = 0.0
+    taubar = 0.0
+    rhobar = 0.0
+    if sei
+        ztau = theta[layout.i_tau]
+        zrho = theta[layout.i_rho]
+        ptau = logistic(ztau)
+        prho = logistic(zrho)
+        lp += accuracy_logpdf_z(SEI_TAU_PRIOR, ztau, ptau, jacobian) +
+              accuracy_logpdf_z(SEI_RHO_PRIOR, zrho, prho, jacobian)
+        g[layout.i_tau] += accuracy_dlogpdf_dz(SEI_TAU_PRIOR, ztau, ptau, jacobian)
+        g[layout.i_rho] += accuracy_dlogpdf_dz(SEI_RHO_PRIOR, zrho, prho, jacobian)
+        tau = clamp_prob(ptau)
+        rho = clamp_prob(prho)
+        dtau_dz = tau == ptau ? ptau * (1.0 - ptau) : 0.0
+        drho_dz = rho == prho ? prho * (1.0 - prho) : 0.0
+    end
+    # multipliers on the natural scale and their adjoints (pinned ones are
+    # constants: no slot, no prior)
+    em = Vector{Float64}(undef, sei ? N_TESTS : 0)
+    embar = zeros(sei ? N_TESTS : 0)
+    if sei
+        @inbounds for k in 1:N_TESTS
+            slot = layout.e_slot[k]
+            if slot == 0
+                em[k] = layout.e_pin[k]
+            else
+                zm = theta[slot]
+                m = logistic(zm)
+                em[k] = m
+                lp += accuracy_logpdf_z(SEI_MULT_PRIOR, zm, m, jacobian)
+                g[slot] += accuracy_dlogpdf_dz(SEI_MULT_PRIOR, zm, m, jacobian)
+                # penalty on m*Se + Sp > 1 (see logposterior):
+                # -w * log1pexp(-(m Se + Sp - 1)/s), derivative w/s * logistic(x)
+                # times Se for m, m for Se, 1 for Sp
+                if penalty
+                    x = -(m * Se[k] + Sp[k] - 1.0) / PENALTY_SCALE
+                    lp -= PENALTY_WEIGHT * log1pexp(x)
+                    dpen = PENALTY_WEIGHT * logistic(x) / PENALTY_SCALE
+                    embar[k] += dpen * Se[k]
+                    sebar[k] += dpen * m
+                    spbar[k] += dpen
+                end
+            end
+        end
+    end
+    work = SEIWork(sei ? nmax : 0)
+
     u_pre = Vector{Float64}(undef, nmax)   # u before the transition at step j
     v_pre = Vector{Float64}(undef, nmax)
     lam_j = Vector{Float64}(undef, nmax)   # hazard applied entering step j
@@ -282,7 +338,27 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
         e = data.seq_ends[i]
         n = e - start + 1
         ey = data.entry_year[i]
-        pi1 = pi1_vec[ey]
+        # born badgers start susceptible, so no pi1 gradient from them
+        born = data.born[i]
+        pi1 = born ? 0.0 : pi1_vec[ey]
+
+        if sei
+            # three-state sweep is in sei.jl
+            ll_i, pibar_i, rhobar_i, taubar_i =
+                sei_seq_sweep!(work, data, start, e, pi1, rho, tau, alpha, gamma,
+                               Se, Sp, em, S,
+                               gbar_alpha, gbar_gamma, sebar, spbar, embar)
+            lp += ll_i
+            rhobar += rhobar_i
+            taubar += taubar_i
+            if !born
+                gbar_pi1_0 += pibar_i * dpi1_d0[ey]
+                gbar_pi1_mult += pibar_i * dpi1_dmult[ey]
+                gbar_gamma[ey] += pibar_i * dpi1_dgamma[ey]
+            end
+            start = e + 1
+            continue
+        end
 
         u = 1.0 - pi1
         v = pi1
@@ -420,9 +496,11 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
 
         # Seed at j=1: u = 1-pi1, v = pi1  =>  d/dpi1 = vbar - ubar
         pibar = vbar - ubar
-        gbar_pi1_0 += pibar * dpi1_d0[ey]
-        gbar_pi1_mult += pibar * dpi1_dmult[ey]
-        gbar_gamma[ey] += pibar * dpi1_dgamma[ey]
+        if !born
+            gbar_pi1_0 += pibar * dpi1_d0[ey]
+            gbar_pi1_mult += pibar * dpi1_dmult[ey]
+            gbar_gamma[ey] += pibar * dpi1_dgamma[ey]
+        end
 
         start = e + 1
     end
@@ -455,6 +533,15 @@ function logposterior_grad!(g::Vector{Float64}, theta::Vector{Float64},
     end
     g[layout.i_pi1_0] += gbar_pi1_0
     g[layout.i_pi1_mult] += gbar_pi1_mult
+    if sei
+        g[layout.i_tau] += taubar * dtau_dz
+        g[layout.i_rho] += rhobar * drho_dz
+        @inbounds for k in 1:N_TESTS
+            slot = layout.e_slot[k]
+            slot == 0 && continue
+            g[slot] += embar[k] * em[k] * (1.0 - em[k])
+        end
+    end
 
     # Fold the gamma adjoints back onto (raw, log_sigma).
     #

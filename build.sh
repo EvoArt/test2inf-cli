@@ -180,7 +180,26 @@ if [ -f testdata/sim.csv ]; then
     fail=1
   fi
   rm -f .metric_probe.csv
-  run_variant "hmc: explicit eps/L" --method hmc --draws 50 --warmup 50               --hmc-eps 0.3 --hmc-L 7 --model all_fixed || true
+  # no --model here: the pre-tuned sets are for rw1 and are refused under rw1c
+  run_variant "hmc: explicit eps/L" --method hmc --draws 50 --warmup 50               --hmc-eps 0.3 --hmc-L 7
+  # three-state model, sampled paths, multi-start, births
+  run_variant "map: three states (fixed)"    --method map --states 3
+  run_variant "map: three states (inferred)" --method map --states 3 --infer-sesp
+  run_variant "map: three states, pinned Sp" --method map --states 3 --infer-sesp --pin-sp 3=1.0
+  run_variant "map: three states, pinned multipliers" --method map --states 3 --e-mult 3=0 --e-mult 1=1
+  run_variant "map: three states, culture only" --method map --states 3 --tests 3
+  run_variant "nuts: three states, jittered start" --method nuts --draws 50 --warmup 50 --states 3 --init-jitter 1
+  run_variant "nuts: three states, multi-start" --method nuts --draws 50 --warmup 50 --states 3 --init-starts 3
+  printf 'id,birth\n1,1\n2,1\n3,2\n' > .birth_probe.csv
+  run_variant "map: three states + births"  --method map --states 3 --infer-sesp --birth .birth_probe.csv
+  run_variant "nuts: two states + births + sampled paths" --method nuts --draws 50 --warmup 50 \
+              --birth .birth_probe.csv --traj-draws 10 --traj-mode sample
+  rm -f .birth_probe.csv
+  run_variant "nuts: three states + sampled paths" --method nuts --draws 50 --warmup 50 \
+              --states 3 --infer-sesp --traj-draws 10 --traj-mode sample
+  run_variant "nuts: two states + sampled paths"   --method nuts --draws 50 --warmup 50 \
+              --traj-draws 10 --traj-mode sample
+  run_variant "nutsthenhmc: three states"    --method nutsthenhmc --draws 50 --warmup 50 --states 3
   rm -rf .verify .verify.err
   if [ "$fail" -ne 0 ]; then
     echo "Bundle verification FAILED; not fit to ship." >&2

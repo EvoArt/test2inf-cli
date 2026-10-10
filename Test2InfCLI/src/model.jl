@@ -175,7 +175,16 @@ struct HMMData
     tidx::Vector{Int}         # which assay (1..N_TESTS) each val belongs to
     ids::Vector{Int}          # badger id per sequence
     captured::Vector{Bool}    # was the badger actually caught at this timestep?
+    born::Vector{Bool}        # per badger: does its record start at its birth?
 end
+
+"""
+P(infected) at the first step of badger `i`'s record: zero if the record starts
+at its birth, otherwise pi1 for its entry year. Used by the likelihood, the
+gradient, the smoother and the path sampler, which must all agree.
+"""
+@inline entry_prob(data::HMMData, pi1_vec::AbstractVector{T}, i::Int) where {T} =
+    data.born[i] ? zero(T) : pi1_vec[data.entry_year[i]]
 
 """
 Which parameters are free, and where they sit in the flat vector θ.
@@ -213,15 +222,29 @@ struct ParamLayout
     i_sp::Int
     sp_pin::NTuple{N_TESTS,Float64}   # NaN = free, otherwise the pinned value
     sp_slot::NTuple{N_TESTS,Int}      # index in θ, or 0 when pinned
+    # Three-state model. These go after the Se/Sp slots so the two-state
+    # indices above don't move. All 0 when `sei` is false.
+    sei::Bool
+    i_tau::Int                        # logit of the per-timestep E -> I hazard
+    i_rho::Int                        # logit of P(I | infected) at first capture
+    e_pin::NTuple{N_TESTS,Float64}    # NaN = free, otherwise the pinned multiplier
+    e_slot::NTuple{N_TESTS,Int}       # index of logit(multiplier) in θ, 0 if pinned
 end
 
 const NO_SP_PIN = ntuple(_ -> NaN, N_TESTS)
 
-@inline is_pinned(layout::ParamLayout, k::Int) = layout.sp_slot[k] == 0
+# Exposed-state multipliers: P(+ | E) = m_k Se_k, m_k in [0, 1], as in the
+# iFFBS badger model (theta in I, theta * rho in E). Specificity only applies
+# to U so it has no multiplier. NaN = estimate, otherwise pinned (like sp_pin).
+const NO_E_PIN = ntuple(_ -> NaN, N_TESTS)
+# culture blind to E, everything else as for I (used in tests)
+const E_PIN_CULTURE_SPLIT = (1.0, 1.0, 0.0, 1.0, 1.0, 1.0)
 
 function ParamLayout(S::Int, n_years::Int, infer_sesp::Bool,
                      year_process::Int = PROC_RW1,
-                     sp_pin::NTuple{N_TESTS,Float64} = NO_SP_PIN)
+                     sp_pin::NTuple{N_TESTS,Float64} = NO_SP_PIN,
+                     sei::Bool = false,
+                     e_pin::NTuple{N_TESTS,Float64} = NO_E_PIN)
     i_alpha = 1
     i_logsigma = i_alpha + S
     i_gamma = i_logsigma + 1
@@ -255,9 +278,25 @@ function ParamLayout(S::Int, n_years::Int, infer_sesp::Bool,
         n = i_pi1_mult
         pins = sp_pin
     end
+    i_tau = 0
+    i_rho = 0
+    eslot_v = zeros(Int, N_TESTS)
+    if sei
+        i_tau = n + 1
+        i_rho = n + 2
+        n += 2
+        # one slot per free multiplier (explicit loop, see sp slots above)
+        for k in 1:N_TESTS
+            if isnan(e_pin[k])
+                n += 1
+                eslot_v[k] = n
+            end
+        end
+    end
     return ParamLayout(S, n_years, infer_sesp, year_process, n, i_alpha,
                        i_logsigma, i_gamma, i_pi1_0, i_pi1_mult, i_se, i_sp,
-                       pins, slots)
+                       pins, slots, sei, i_tau, i_rho, e_pin,
+                       NTuple{N_TESTS,Int}(eslot_v))
 end
 
 # --- likelihood ------------------------------------------------------------
@@ -581,6 +620,45 @@ function logposterior(theta::AbstractVector{T}, data::HMMData, layout::ParamLayo
         end
     end
 
+    # Three-state model: tau (E -> I hazard) and rho (share of infected that
+    # are I at entry), both logits with LogitNormal priors.
+    tau = zero(T)
+    rho = zero(T)
+    if layout.sei
+        ztau = theta[layout.i_tau]
+        zrho = theta[layout.i_rho]
+        ptau = logistic(ztau)
+        prho = logistic(zrho)
+        lp = lp + accuracy_logpdf_z(SEI_TAU_PRIOR, ztau, ptau, jacobian) +
+                  accuracy_logpdf_z(SEI_RHO_PRIOR, zrho, prho, jacobian)
+        tau = clamp_prob(ptau)
+        rho = clamp_prob(prho)
+    end
+    # exposed-state multipliers; a pinned one has no slot and no prior
+    em = Vector{T}(undef, layout.sei ? N_TESTS : 0)
+    if layout.sei
+        @inbounds for k in 1:N_TESTS
+            slot = layout.e_slot[k]
+            if slot == 0
+                em[k] = T(layout.e_pin[k])
+            else
+                zm = theta[slot]
+                m = logistic(zm)
+                em[k] = m
+                lp = lp + accuracy_logpdf_z(SEI_MULT_PRIOR, zm, m, jacobian)
+                # Same penalty as Se+Sp>1 but for E: m*Se + Sp > 1, so an
+                # exposed badger is at least as likely to test positive as an
+                # uninfected one. Without it the fit puts E below U on the
+                # sparse assays (DPP, IGRA) and goes multimodal. Free
+                # multipliers only.
+                if penalty
+                    lp = lp - PENALTY_WEIGHT *
+                         log1pexp(-(m * Se[k] + Sp[k] - 1.0) / PENALTY_SCALE)
+                end
+            end
+        end
+    end
+
     # pi1 per year, then the HMM likelihood badger by badger.
     pi1_vec = Vector{T}(undef, n_years)
     @inbounds for y in 1:n_years
@@ -590,8 +668,13 @@ function logposterior(theta::AbstractVector{T}, data::HMMData, layout::ParamLayo
     start = 1
     @inbounds for i in 1:data.n_ind
         e = data.seq_ends[i]
-        lp = lp + seq_loglik(data, start, e, pi1_vec[data.entry_year[i]],
-                             alpha, gamma, Se, Sp, S)
+        if layout.sei
+            lp = lp + seq_loglik_sei(data, start, e, entry_prob(data, pi1_vec, i),
+                                     rho, tau, alpha, gamma, Se, Sp, em, S)
+        else
+            lp = lp + seq_loglik(data, start, e, entry_prob(data, pi1_vec, i),
+                                 alpha, gamma, Se, Sp, S)
+        end
         start = e + 1
     end
     return lp
@@ -618,6 +701,11 @@ struct Params
     pi1_vec::Vector{Float64}
     Se::Vector{Float64}
     Sp::Vector{Float64}
+    # three-state only (tau, rho are 0 otherwise)
+    sei::Bool
+    tau::Float64
+    rho::Float64
+    em::Vector{Float64}               # exposed-state multiplier per assay
 end
 
 function extract_params(theta::Vector{Float64}, layout::ParamLayout)
@@ -646,7 +734,14 @@ function extract_params(theta::Vector{Float64}, layout::ParamLayout)
         Sp = [isnan(layout.sp_pin[k]) ? SP_FIXED_DEFAULT[k] : layout.sp_pin[k]
               for k in 1:N_TESTS]
     end
-    return Params(alpha, sigma_g, gamma, pi1_0, pi1_mult, pi1_vec, Se, Sp)
+    # same clamp as the likelihood
+    tau = layout.sei ? clamp_prob(logistic(theta[layout.i_tau])) : 0.0
+    rho = layout.sei ? clamp_prob(logistic(theta[layout.i_rho])) : 0.0
+    em = layout.sei ?
+         [layout.e_slot[k] == 0 ? layout.e_pin[k] : logistic(theta[layout.e_slot[k]])
+          for k in 1:N_TESTS] : Float64[]
+    return Params(alpha, sigma_g, gamma, pi1_0, pi1_mult, pi1_vec, Se, Sp,
+                  layout.sei, tau, rho, em)
 end
 
 "Annual hazard implied by the seasonal intercepts and that year's effect."

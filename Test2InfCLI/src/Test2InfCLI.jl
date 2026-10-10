@@ -24,9 +24,10 @@ module Test2InfCLI
 
 include("dual.jl")
 include("model.jl")
+include("rng.jl")
+include("sei.jl")
 include("grad_analytic.jl")
 include("optimize.jl")
-include("rng.jl")
 include("nuts.jl")
 include("hmc.jl")
 include("pretuned.jl")
@@ -106,7 +107,8 @@ OPTIONS:
                        parameter count drops. With Se/Sp fixed it overrides that
                        assay's Table 1 value (culture 0.999 -> 1.0), which is a
                        different model, not a no-op.
-  --no-penalty         Drop the Se+Sp>1 identifiability penalty
+  --no-penalty         Drop the Se+Sp>1 identifiability penalty (and, with
+                       --states 3, the matching e_mult*Se+Sp>1 penalty)
   --repeat <mode>      stack | pool | last                 (default: stack)
   --draws <int>        Post-warmup draws                   (default: 1000)
   --warmup <int>       Warmup iterations                   (default: 1000)
@@ -137,16 +139,49 @@ OPTIONS:
                        spaced subsample of this many draws (default: 0, off).
                        nuts/hmc only. Costs one forward-backward pass per
                        badger per draw kept.
+  --traj-mode <m>      threshold | sample                (default: threshold)
+                       How the infection time in trajectories.csv is found for
+                       each kept draw.
+                       threshold   first timestep where smoothed P(infected)
+                                   reaches 0.5
+                       sample      sample a state path given that draw's
+                                   parameters (forward filtering, backward
+                                   sampling)
+  --states <2|3>       2 (default): uninfected -> infected.
+                       3: uninfected -> exposed -> infectious. Adds `tau`
+                       (per-timestep E -> I hazard), `rho` (share of badgers
+                       infected at first capture that are already infectious)
+                       and a multiplier per assay, `e_mult[k]`, with
+                         P(+ | exposed) = e_mult[k] * Se[k]
+                       and a Uniform(0,1) prior.
+  --e-mult <k>=<v>     Pin assay k's multiplier to v in [0, 1]. Repeatable.
+                       Assays excluded by --tests are pinned automatically.
+  --birth <path>       CSV with header `id,birth` giving birth timesteps on the
+                       data's grid. Listed badgers start susceptible at birth;
+                       the rest keep the estimated entry probability. Births
+                       before timestep 1 or after first capture are ignored.
+  --init-starts <n>    Run the initial optimiser from n starting points and
+                       start from the best optimum (default: 1). The starts do
+                       not depend on --seed, so every chain picks the same
+                       optimum. All optima are printed. For posteriors with a
+                       minor mode that chains can get stuck in.
+  --init-jitter <sd>   Add Normal(0, sd) noise to the starting point (seeded by
+                       --seed) before the initial optimiser runs (default: 0).
+                       Chains then start in different places, so separated
+                       modes show up as Rhat > 1.
   --help               Show this message
 
 OUTPUTS (in --out):
   prevalence.csv       Prevalence by timestep
   parameters.csv       Point estimates (or posterior means) per parameter
-  p_infected.csv       P(infected) per badger at each capture
+  p_infected.csv       P(infected) per badger at each capture. With --states 3
+                       p_infected is P(exposed or infectious), and p_exposed
+                       and p_infectious split it.
   year_effects.csv     Year effect and implied annual hazard
   draws.csv            Posterior draws, one column per parameter (nuts/hmc)
   prevalence_draws.csv Prevalence per timestep per draw   (--traj-draws)
-  trajectories.csv     Infection time per badger per draw (--traj-draws)
+  trajectories.csv     Infection time per badger per draw (--traj-draws); with
+                       --states 3 also the time of becoming infectious
 """
 
 # --- argument parsing ------------------------------------------------------
@@ -174,6 +209,12 @@ struct Options
     accuracy_prior::Int  # ACC_BETA or ACC_LOGITNORMAL
     year_weight::Bool    # data-adaptive year-increment prior
     sp_pin::NTuple{N_TESTS,Float64}   # NaN = infer, otherwise pin to this value
+    sei::Bool                         # three-state U -> E -> I model
+    e_pin::NTuple{N_TESTS,Float64}    # NaN = estimate, else pinned E multiplier
+    traj_sample::Bool                 # sample state paths rather than threshold
+    init_jitter::Float64              # sd of the start-point perturbation, 0 = off
+    birth::String                     # path to an id,birth CSV, "" if unset
+    init_starts::Int                  # optimiser starts to choose the best of
 end
 
 function parse_int(s::AbstractString, name::AbstractString)
@@ -220,6 +261,12 @@ function parse_args(args::Vector{String})
     model = ""
     hmc_eps = -1.0
     hmc_L = -1
+    sei = false
+    e_pin = NO_E_PIN
+    traj_sample = false
+    init_jitter = 0.0
+    birth = ""
+    init_starts = 1
 
     i = 1
     n = length(args)
@@ -339,6 +386,46 @@ function parse_args(args::Vector{String})
         elseif a == "--hmc-L"
             i += 1; i <= n || error("--hmc-L needs a value")
             hmc_L = parse_int(args[i], "hmc-L")
+        elseif a == "--states"
+            i += 1; i <= n || error("--states needs a value")
+            ns = parse_int(args[i], "states")
+            (ns == 2 || ns == 3) || error("--states must be 2 or 3")
+            sei = ns == 3
+        elseif a == "--e-mult"
+            # "<index>=<value>", repeatable, same parsing as --pin-sp
+            i += 1; i <= n || error("--e-mult needs a value")
+            espec = args[i]
+            eeq = findfirst('=', espec)
+            eeq === nothing && error("--e-mult expects <index>=<value>, got \"$espec\"")
+            ek = parse_int(espec[1:(eeq - 1)], "e-mult index")
+            (1 <= ek <= N_TESTS) || error("--e-mult index $ek out of range 1..$N_TESTS")
+            ev = parse_float(espec[(eeq + 1):end], "e-mult value")
+            (0.0 <= ev <= 1.0) || error("--e-mult value must be in [0, 1], got $ev")
+            ep_new = zeros(Float64, N_TESTS)
+            for j in 1:N_TESTS
+                ep_new[j] = j == ek ? ev : e_pin[j]
+            end
+            e_pin = NTuple{N_TESTS,Float64}(ep_new)
+        elseif a == "--birth"
+            i += 1; i <= n || error("--birth needs a value"); birth = args[i]
+        elseif a == "--init-starts"
+            i += 1; i <= n || error("--init-starts needs a value")
+            init_starts = parse_int(args[i], "init-starts")
+            init_starts >= 1 || error("--init-starts must be at least 1")
+        elseif a == "--init-jitter"
+            i += 1; i <= n || error("--init-jitter needs a value")
+            init_jitter = parse_float(args[i], "init-jitter")
+            init_jitter >= 0.0 || error("--init-jitter must not be negative")
+        elseif a == "--traj-mode"
+            i += 1; i <= n || error("--traj-mode needs a value")
+            tm = args[i]
+            if tm == "sample"
+                traj_sample = true
+            elseif tm == "threshold"
+                traj_sample = false
+            else
+                error("--traj-mode must be threshold or sample")
+            end
         else
             error("unknown argument: $a")
         end
@@ -349,6 +436,14 @@ function parse_args(args::Vector{String})
     method in ("map", "nuts", "hmc", "nutsthenhmc") ||
         error("--method must be map, nutsthenhmc, nuts or hmc")
     any(tests) || error("--tests selected no assays")
+    # pin multipliers of assays not in the fit (nothing informs them)
+    if sei
+        ep_fix = zeros(Float64, N_TESTS)
+        for j in 1:N_TESTS
+            ep_fix[j] = (!tests[j] && isnan(e_pin[j])) ? 1.0 : e_pin[j]
+        end
+        e_pin = NTuple{N_TESTS,Float64}(ep_fix)
+    end
     # Fixed-L HMC adapts nothing, so a step size, a trajectory length and a
     # metric must all come from somewhere. --model supplies all three; --metric
     # supplies only the metric, so it still needs --hmc-eps and --hmc-L beside
@@ -362,7 +457,8 @@ function parse_args(args::Vector{String})
     return Options(data, method, out, seasons, tests, infer_sesp, penalty,
                    repeat_captures, draws, warmup, accept, seed, maxiter,
                    year_process, traj_draws, metric, write_metric_path,
-                   model, hmc_eps, hmc_L, accuracy_prior, year_weight, sp_pin)
+                   model, hmc_eps, hmc_L, accuracy_prior, year_weight, sp_pin,
+                   sei, e_pin, traj_sample, init_jitter, birth, init_starts)
 end
 
 "Name of a year process, for reporting."
@@ -396,7 +492,64 @@ function initial_theta(layout::ParamLayout)
             theta[slot] = log(SP_FIXED_DEFAULT[k] / (1 - SP_FIXED_DEFAULT[k]))
         end
     end
+    if layout.sei
+        # prior medians
+        theta[layout.i_tau] = SEI_TAU_PRIOR.p
+        theta[layout.i_rho] = SEI_RHO_PRIOR.p
+        for k in 1:N_TESTS
+            slot = layout.e_slot[k]
+            slot == 0 && continue
+            theta[slot] = SEI_MULT_PRIOR.p
+        end
+    end
     return theta
+end
+
+"`initial_theta`, plus `--init-jitter` noise if set (own RNG stream)."
+function start_theta(opts::Options, layout::ParamLayout)
+    theta = initial_theta(layout)
+    opts.init_jitter > 0.0 || return theta
+    rng = Rng(opts.seed + 104729)
+    @inbounds for i in eachindex(theta)
+        theta[i] += opts.init_jitter * rand_normal(rng)
+    end
+    return theta
+end
+
+# sd of the extra starting points (unconstrained scale)
+const INIT_STARTS_SD = 1.0
+# the optima get compared, so let the optimiser run long enough to converge
+const INIT_STARTS_MAXITER = 2000
+
+"""
+    best_start(opts, layout, negf!, maxiter) -> OptResult
+
+Optimum to start from. With `--init-starts n > 1` the optimiser is also run
+from n - 1 perturbed starts and the best result is kept. The perturbations use
+a fixed RNG seed (not `--seed`) so every chain ends up at the same optimum.
+"""
+function best_start(opts::Options, layout::ParamLayout, negf!::F,
+                    maxiter::Int) where {F}
+    n = opts.init_starts
+    best = lbfgs(negf!, start_theta(opts, layout);
+                 maxiter = n > 1 ? max(maxiter, INIT_STARTS_MAXITER) : maxiter)
+    n > 1 || return best
+    println(Core.stdout, "init start 1: log posterior ", best.logp)
+    rng = Rng(982451653)
+    for s in 2:n
+        theta = initial_theta(layout)
+        @inbounds for i in eachindex(theta)
+            theta[i] += INIT_STARTS_SD * rand_normal(rng)
+        end
+        r = lbfgs(negf!, theta; maxiter = max(maxiter, INIT_STARTS_MAXITER))
+        println(Core.stdout, "init start ", s, ": log posterior ", r.logp)
+        # a diverged start must not win
+        if isfinite(r.logp) && (!isfinite(best.logp) || r.logp > best.logp)
+            best = r
+        end
+    end
+    println(Core.stdout, "init: best of ", n, " starts, log posterior ", best.logp)
+    return best
 end
 
 function param_names(layout::ParamLayout)
@@ -421,6 +574,14 @@ function param_names(layout::ParamLayout)
             push!(names, "Sp[$k]")
         end
     end
+    if layout.sei
+        push!(names, "tau")
+        push!(names, "rho")
+        for k in 1:N_TESTS
+            layout.e_slot[k] == 0 && continue
+            push!(names, "e_mult[$k]")
+        end
+    end
     return names
 end
 
@@ -430,19 +591,51 @@ P(infected) per badger per capture, and the prevalence trajectory over the
 grid of observed timesteps.
 """
 function decode(data::HMMData, P::Params)
+    if P.sei
+        # P(infected) = P(exposed) + P(infectious)
+        p_exp, p_infectious = decode_sei(data, P)
+        @inbounds for j in eachindex(p_exp)
+            p_exp[j] += p_infectious[j]
+        end
+        return p_exp
+    end
     n = length(data.times)
     p_inf = Vector{Float64}(undef, n)
     start = 1
     for i in 1:data.n_ind
         e = data.seq_ends[i]
         gam = forward_backward_seq(data, start, e,
-                                   P.pi1_vec[data.entry_year[i]], P, data.S)
+                                   entry_prob(data, P.pi1_vec, i), P, data.S)
         for (j, gj) in enumerate(gam)
             p_inf[start + j - 1] = gj
         end
         start = e + 1
     end
     return p_inf
+end
+
+"""
+P(infected), P(exposed) and P(infectious) per capture. The last two are empty
+vectors under the two-state model.
+"""
+function decode_all(data::HMMData, P::Params)
+    if P.sei
+        p_exp, p_ifs = decode_sei(data, P)
+        p_inf = Vector{Float64}(undef, length(p_exp))
+        @inbounds for j in eachindex(p_exp)
+            p_inf[j] = p_exp[j] + p_ifs[j]
+        end
+        return p_inf, p_exp, p_ifs
+    end
+    return decode(data, P), Float64[], Float64[]
+end
+
+"First timestep in `lo:hi` at which `p` reaches a half, or 0 if it never does."
+function first_crossing(data::HMMData, p::Vector{Float64}, lo::Int, hi::Int)
+    @inbounds for j in lo:hi
+        p[j] >= 0.5 && return data.times[j]
+    end
+    return 0
 end
 
 """
@@ -464,9 +657,17 @@ Writes:
   prevalence_draws.csv  time, then one column per draw (capture-weighted)
   trajectories.csv      id, draw, infection_time  (0 = never infected in record)
 
-Infection time is the first timestep where P(infected) >= 0.5, matching the
-package's `infection_times_from_draws`. The state is absorbing, so a trajectory
-is fully described by when it crossed.
+Infection time is, by default, the first timestep where P(infected) >= 0.5,
+matching the package's `infection_times_from_draws`. The state is absorbing, so
+a trajectory is fully described by when it crossed. With `--traj-mode sample`
+it is read off a state path drawn by `sample_path!` instead.
+
+A badger already infected at the first step of its record gets that step's
+time. With `--birth` the record starts at birth, so the infection time can fall
+before the first capture.
+
+With three states `infection_time` is entry to E, `trajectories.csv` also has
+`infectious_time` (entry to I), and `prevalence_infectious_draws.csv` is written.
 """
 function draw_outputs(opts::Options, data::HMMData, layout::ParamLayout,
                       draws::Matrix{Float64}, n_traj::Int)
@@ -483,10 +684,27 @@ function draw_outputs(opts::Options, data::HMMData, layout::ParamLayout,
         tpos[t] = i
     end
 
+    sei = layout.sei
     prev_cols = Vector{Vector{Float64}}(undef, keep)
+    prev_ifs_cols = Vector{Vector{Float64}}(undef, sei ? keep : 0)
     traj_id = Float64[]
     traj_draw = Float64[]
     traj_time = Float64[]
+    traj_ifs = Float64[]
+
+    # scratch for the path sampler (own RNG stream)
+    nmax = 0
+    start = 1
+    for i in 1:data.n_ind
+        nmax = max(nmax, data.seq_ends[i] - start + 1)
+        start = data.seq_ends[i] + 1
+    end
+    states = Vector{Int}(undef, nmax)
+    fU = Vector{Float64}(undef, nmax)
+    fE = Vector{Float64}(undef, nmax)
+    fI = Vector{Float64}(undef, nmax)
+    lam_step = Vector{Float64}(undef, nmax)
+    rng = Rng(opts.seed + 7919)
 
     d = size(draws, 1)
     theta_k = Vector{Float64}(undef, d)
@@ -495,15 +713,17 @@ function draw_outputs(opts::Options, data::HMMData, layout::ParamLayout,
             theta_k[i] = draws[i, k]
         end
         Pk = extract_params(theta_k, layout)
-        pk = decode(data, Pk)
+        pk, _, pk_ifs = decode_all(data, Pk)
 
         # prevalence for this draw, over CAPTURED badgers (see prevalence_by_time)
         sums = zeros(length(tset))
+        sums_ifs = zeros(length(tset))
         cnts = zeros(Int, length(tset))
         @inbounds for j in eachindex(data.times)
             data.captured[j] || continue
             ti = tpos[data.times[j]]
             sums[ti] += pk[j]
+            sei && (sums_ifs[ti] += pk_ifs[j])
             cnts[ti] += 1
         end
         col = Vector{Float64}(undef, length(tset))
@@ -511,21 +731,40 @@ function draw_outputs(opts::Options, data::HMMData, layout::ParamLayout,
             col[i] = cnts[i] > 0 ? sums[i] / cnts[i] : NaN
         end
         prev_cols[kk] = col
+        if sei
+            col_ifs = Vector{Float64}(undef, length(tset))
+            @inbounds for i in eachindex(tset)
+                col_ifs[i] = cnts[i] > 0 ? sums_ifs[i] / cnts[i] : NaN
+            end
+            prev_ifs_cols[kk] = col_ifs
+        end
 
         # infection time per badger for this draw
         start = 1
         @inbounds for i in 1:data.n_ind
             e = data.seq_ends[i]
             t_inf = 0
-            for j in start:e
-                if pk[j] >= 0.5
-                    t_inf = data.times[j]
-                    break
+            t_ifs = 0
+            if opts.traj_sample
+                n = sample_path!(states, rng, fU, fE, fI, lam_step, data, start, e,
+                                 entry_prob(data, Pk.pi1_vec, i), Pk, data.S)
+                for j in 1:n
+                    st = states[j]
+                    st == 0 && continue
+                    t_inf == 0 && (t_inf = data.times[start + j - 1])
+                    if st == 2
+                        t_ifs = data.times[start + j - 1]
+                        break
+                    end
                 end
+            else
+                t_inf = first_crossing(data, pk, start, e)
+                sei && (t_ifs = first_crossing(data, pk_ifs, start, e))
             end
             push!(traj_id, Float64(data.ids[i]))
             push!(traj_draw, Float64(kk))
             push!(traj_time, Float64(t_inf))
+            sei && push!(traj_ifs, Float64(t_ifs))
             start = e + 1
         end
     end
@@ -539,8 +778,20 @@ function draw_outputs(opts::Options, data::HMMData, layout::ParamLayout,
         cols[kk + 1] = prev_cols[kk]
     end
     write_csv(joinpath(opts.out, "prevalence_draws.csv"), hdr, cols)
-    write_csv(joinpath(opts.out, "trajectories.csv"),
-              ["id", "draw", "infection_time"], [traj_id, traj_draw, traj_time])
+    if sei
+        cols_ifs = Vector{Vector{Float64}}(undef, keep + 1)
+        cols_ifs[1] = Float64.(tset)
+        for kk in 1:keep
+            cols_ifs[kk + 1] = prev_ifs_cols[kk]
+        end
+        write_csv(joinpath(opts.out, "prevalence_infectious_draws.csv"), hdr, cols_ifs)
+        write_csv(joinpath(opts.out, "trajectories.csv"),
+                  ["id", "draw", "infection_time", "infectious_time"],
+                  [traj_id, traj_draw, traj_time, traj_ifs])
+    else
+        write_csv(joinpath(opts.out, "trajectories.csv"),
+                  ["id", "draw", "infection_time"], [traj_id, traj_draw, traj_time])
+    end
     return nothing
 end
 
@@ -582,13 +833,23 @@ end
 # --- output ----------------------------------------------------------------
 function write_outputs(opts::Options, data::HMMData, layout::ParamLayout,
                        P::Params, theta::Vector{Float64}, p_inf::Vector{Float64},
-                       post_sd::Union{Nothing,Vector{Float64}})
+                       post_sd::Union{Nothing,Vector{Float64}},
+                       p_exp::Vector{Float64} = Float64[],
+                       p_ifs::Vector{Float64} = Float64[])
     isdir(opts.out) || mkpath(opts.out)
 
     tset, prev, tot = prevalence_by_time(data, p_inf)
-    write_csv(joinpath(opts.out, "prevalence.csv"),
-              ["time", "prevalence", "n_captures"],
-              [Float64.(tset), prev, tot])
+    if layout.sei
+        # infected = exposed or infectious; infectious added as an extra column
+        _, prev_ifs, _ = prevalence_by_time(data, p_ifs)
+        write_csv(joinpath(opts.out, "prevalence.csv"),
+                  ["time", "prevalence", "n_captures", "prevalence_infectious"],
+                  [Float64.(tset), prev, tot, prev_ifs])
+    else
+        write_csv(joinpath(opts.out, "prevalence.csv"),
+                  ["time", "prevalence", "n_captures"],
+                  [Float64.(tset), prev, tot])
+    end
 
     # Parameters on the natural scale.
     pnames = String[]
@@ -607,6 +868,14 @@ function write_outputs(opts::Options, data::HMMData, layout::ParamLayout,
     end
     for k in 1:N_TESTS
         push!(pnames, "Sp[$k]"); push!(pvals, P.Sp[k])
+    end
+    if layout.sei
+        push!(pnames, "tau"); push!(pvals, P.tau)
+        push!(pnames, "rho"); push!(pvals, P.rho)
+        # all six, including pinned ones
+        for k in 1:N_TESTS
+            push!(pnames, "e_mult[$k]"); push!(pvals, P.em[k])
+        end
     end
 
     io = open(joinpath(opts.out, "parameters.csv"), "w")
@@ -638,8 +907,14 @@ function write_outputs(opts::Options, data::HMMData, layout::ParamLayout,
         end
         start = e + 1
     end
-    write_csv(joinpath(opts.out, "p_infected.csv"),
-              ["id", "time", "p_infected"], [idcol, tcol, p_inf])
+    if layout.sei
+        write_csv(joinpath(opts.out, "p_infected.csv"),
+                  ["id", "time", "p_infected", "p_exposed", "p_infectious"],
+                  [idcol, tcol, p_inf, p_exp, p_ifs])
+    else
+        write_csv(joinpath(opts.out, "p_infected.csv"),
+                  ["id", "time", "p_infected"], [idcol, tcol, p_inf])
+    end
 
     yidx = Float64[]
     yeff = Float64[]
@@ -724,15 +999,14 @@ end
 # of unresolved-call trim errors.
 
 function run_map(opts::Options, data::HMMData, layout::ParamLayout, negf!::F) where {F}
-    theta0 = initial_theta(layout)
-    res = lbfgs(negf!, theta0; maxiter = opts.maxiter)
+    res = best_start(opts, layout, negf!, opts.maxiter)
     println(Core.stdout, "log posterior: ", res.logp,
             "  iterations: ", res.iterations,
             "  converged: ", res.converged,
             "  |grad|: ", res.grad_norm)
     P = extract_params(res.theta, layout)
-    p_inf = decode(data, P)
-    write_outputs(opts, data, layout, P, res.theta, p_inf, nothing)
+    p_inf, p_exp, p_ifs = decode_all(data, P)
+    write_outputs(opts, data, layout, P, res.theta, p_inf, nothing, p_exp, p_ifs)
     return nothing
 end
 
@@ -750,8 +1024,7 @@ function run_nuts(opts::Options, data::HMMData, layout::ParamLayout,
     end
 
     # Start from the MAP: a short optimise first makes warmup far cheaper.
-    theta0 = initial_theta(layout)
-    opt = lbfgs(negf!, theta0; maxiter = 200)
+    opt = best_start(opts, layout, negf!, 200)
     println(Core.stdout, "MAP init: log posterior ", opt.logp)
 
     res = nuts(gradf!, opt.theta, opts.draws, opts.warmup, opts.accept, opts.seed)
@@ -799,8 +1072,7 @@ function run_nutsthenhmc(opts::Options, data::HMMData, layout::ParamLayout,
         (g, x) -> grad!(g, logp, x, data, layout, se_pr, sp_pr, pen, yw, true)
     end
 
-    theta0 = initial_theta(layout)
-    opt = lbfgs(negf!, theta0; maxiter = 200)
+    opt = best_start(opts, layout, negf!, 200)
     println(Core.stdout, "MAP init: log posterior ", opt.logp)
 
     nth = nuts_then_hmc(gradf!, opt.theta, opts.draws, opts.warmup,
@@ -877,23 +1149,34 @@ function finish_draws(opts::Options, data::HMMData, layout::ParamLayout,
     # Posterior mean of P(infected), averaged over draws.
     n_obs = length(data.times)
     p_acc = zeros(n_obs)
+    n_sei = layout.sei ? n_obs : 0
+    pe_acc = zeros(n_sei)
+    pi_acc = zeros(n_sei)
     theta_k = Vector{Float64}(undef, d)
     for k in 1:ndraw
         @inbounds for i in 1:d
             theta_k[i] = draws[i, k]
         end
         Pk = extract_params(theta_k, layout)
-        pk = decode(data, Pk)
+        pk, pek, pik = decode_all(data, Pk)
         @inbounds for j in 1:n_obs
             p_acc[j] += pk[j]
+        end
+        @inbounds for j in 1:n_sei
+            pe_acc[j] += pek[j]
+            pi_acc[j] += pik[j]
         end
     end
     @inbounds for j in 1:n_obs
         p_acc[j] /= ndraw
     end
+    @inbounds for j in 1:n_sei
+        pe_acc[j] /= ndraw
+        pi_acc[j] /= ndraw
+    end
 
     P = extract_params(means, layout)
-    write_outputs(opts, data, layout, P, means, p_acc, sds)
+    write_outputs(opts, data, layout, P, means, p_acc, sds, pe_acc, pi_acc)
     write_draws(opts, layout, draws)
     draw_outputs(opts, data, layout, draws, opts.traj_draws)
     return nothing
@@ -1007,8 +1290,7 @@ function run_hmc(opts::Options, data::HMMData, layout::ParamLayout,
     eps > 0.0 || error("--method hmc needs a step size (--model or --hmc-eps)")
     L_traj > 0 || error("--method hmc needs a trajectory length (--model or --hmc-L)")
 
-    theta0 = initial_theta(layout)
-    opt = lbfgs(negf!, theta0; maxiter = 200)
+    opt = best_start(opts, layout, negf!, 200)
     println(Core.stdout, "MAP init: log posterior ", opt.logp)
     println(Core.stdout, "step size: ", eps, "  L: ", L_traj)
 
@@ -1030,9 +1312,37 @@ function run_hmc(opts::Options, data::HMMData, layout::ParamLayout,
     return nothing
 end
 
+"""
+Transform for each column of draws.csv: 0 none, 1 `exp`, 2 `logistic`.
+
+The sampler works on log sigma_g and logits but the columns are named
+`sigma_g`, `Se[k]`, `Sp[k]`, `tau`, `rho`, `e_mult[k]`, so they are written on
+the natural scale. (They used to be written raw, which gave BadgerInfeR's pooled
+parameter table a mean of about -1.8 for sigma_g.)
+"""
+function draw_transforms(layout::ParamLayout)
+    kind = zeros(Int, layout.n)
+    kind[layout.i_logsigma] = 1
+    if layout.infer_sesp
+        for k in 1:N_TESTS
+            kind[layout.i_se + k - 1] = 2
+            layout.sp_slot[k] == 0 || (kind[layout.sp_slot[k]] = 2)
+        end
+    end
+    if layout.sei
+        kind[layout.i_tau] = 2
+        kind[layout.i_rho] = 2
+        for k in 1:N_TESTS
+            layout.e_slot[k] == 0 || (kind[layout.e_slot[k]] = 2)
+        end
+    end
+    return kind
+end
+
 function write_draws(opts::Options, layout::ParamLayout, draws::Matrix{Float64})
     isdir(opts.out) || mkpath(opts.out)
     names = param_names(layout)
+    kind = draw_transforms(layout)
     d = size(draws, 1)
     ndraw = size(draws, 2)
     io = open(joinpath(opts.out, "draws.csv"), "w")
@@ -1045,7 +1355,9 @@ function write_draws(opts::Options, layout::ParamLayout, draws::Matrix{Float64})
         for k in 1:ndraw
             for i in 1:d
                 i > 1 && write(io, ",")
-                write(io, fmt(draws[i, k]))
+                x = draws[i, k]
+                write(io, fmt(kind[i] == 1 ? exp(x) :
+                              (kind[i] == 2 ? logistic(x) : x)))
             end
             write(io, "\n")
         end
@@ -1064,9 +1376,21 @@ function run(args::Vector{String})
     end
 
     mat = read_matrix(opts.data)
-    data = build_data(mat, opts.tests, opts.repeat_captures, opts.seasons)
+    # two calls rather than a conditionally assigned Dict (Core.Box, trimming)
+    data = isempty(opts.birth) ?
+           build_data(mat, opts.tests, opts.repeat_captures, opts.seasons) :
+           build_data(mat, opts.tests, opts.repeat_captures, opts.seasons,
+                      read_births(opts.birth))
+    if !isempty(opts.birth)
+        n_born = 0
+        for i in 1:data.n_ind
+            data.born[i] && (n_born += 1)
+        end
+        println(Core.stdout, "births: ", n_born, " badgers start susceptible at birth, ",
+                data.n_ind - n_born, " keep the entry probability")
+    end
     layout = ParamLayout(data.S, data.n_years, opts.infer_sesp, opts.year_process,
-                         opts.sp_pin)
+                         opts.sp_pin, opts.sei, opts.e_pin)
     se_pr, sp_pr = default_accuracy_priors(opts.accuracy_prior)
     # Concretely typed either way: `year_weights` returns an empty vector when
     # the prior is off, so `yw` is always a Vector{Float64} and every call that
@@ -1096,6 +1420,9 @@ function run(args::Vector{String})
             "  year process: ",
             year_process_name(layout.year_process),
             opts.year_weight ? "+yw" : "")
+    # separate println: adding more args to the one above breaks --trim
+    # (Vararg{Any} print call can't be resolved)
+    opts.sei && println(Core.stdout, "states: 3 (uninfected, exposed, infectious)")
 
     # MAP and sampling maximise DIFFERENT functions, and deliberately so.
     #

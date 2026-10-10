@@ -810,7 +810,8 @@ const SPARSE = joinpath(@__DIR__, "..", "testdata", "sparse.csv")
         opts = M.Options(DATA, "nuts", out, 4, fill(true, 6), false, true,
                          :stack, 60, 60, 0.8, 3, 1000, M.PROC_RW1, 10,
                          "", "", "", -1.0, -1,
-                         M.ACC_BETA, false, M.NO_SP_PIN)
+                         M.ACC_BETA, false, M.NO_SP_PIN,
+                         false, M.NO_E_PIN, false, 0.0, "", 1)
         M.draw_outputs(opts, data, layout, res.draws, 10)
 
         pd = M.read_matrix(joinpath(out, "prevalence_draws.csv"))
@@ -839,10 +840,497 @@ const SPARSE = joinpath(@__DIR__, "..", "testdata", "sparse.csv")
         opts2 = M.Options(DATA, "nuts", out2, 4, fill(true, 6), false, true,
                           :stack, 60, 60, 0.8, 3, 1000, M.PROC_RW1, 0,
                           "", "", "", -1.0, -1,
-                          M.ACC_BETA, false, M.NO_SP_PIN)
+                          M.ACC_BETA, false, M.NO_SP_PIN,
+                          false, M.NO_E_PIN, false, 0.0, "", 1)
         M.draw_outputs(opts2, data, layout, res.draws, 0)
         @test !isfile(joinpath(out2, "prevalence_draws.csv"))
         @test !isfile(joinpath(out2, "trajectories.csv"))
+    end
+
+    @testset "three-state gradient agrees with forward-mode AD" begin
+        # Same check as the two-state gradient, over accuracy mode, Jacobian,
+        # Sp pinning, prior family, year process and multiplier pattern.
+        # Sp[3] = 1 with a multiplier pinned to 0 gives a zero emission factor,
+        # which is the case the guards in the sweep are for.
+        all_e = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+        mix_e = (NaN, 0.3, 0.0, NaN, 1.0, NaN)
+        for fixture in (DATA, SPARSE)
+            fmat = M.read_matrix(fixture)
+            fdata = M.build_data(fmat, fill(true, 6), :stack, 4)
+            yw = M.year_weights(fmat, fill(true, 6), fdata.n_years, fdata.S, true)
+            for infer in (false, true), jac in (true, false), pin in (false, true),
+                fam in (M.ACC_LOGITNORMAL, M.ACC_BETA),
+                proc in (M.PROC_RW1C, M.PROC_IID),
+                edet in (M.NO_E_PIN, M.E_PIN_CULTURE_SPLIT, mix_e, all_e)
+
+                sp_pin = pin ? (NaN, NaN, 1.0, NaN, NaN, NaN) : M.NO_SP_PIN
+                lay = M.ParamLayout(fdata.S, fdata.n_years, infer, proc, sp_pin,
+                                    true, edet)
+                se_pr, sp_pr = M.default_accuracy_priors(fam)
+                f = th -> M.logposterior(th, fdata, lay, se_pr, sp_pr, true, yw, jac)
+                th = M.initial_theta(lay) .+ 0.07 .* sin.(1:lay.n)
+                ga = zeros(lay.n)
+                la = M.logposterior_grad!(ga, th, fdata, lay, se_pr, sp_pr, true, yw, jac)
+                gf = zeros(lay.n)
+                lf = M.gradient!(gf, f, th, Val(13))
+                @test isapprox(la, lf; atol = 1e-8)
+                @test all(isfinite, ga)
+                @test maximum(abs.(ga .- gf)) < 1e-9
+            end
+        end
+    end
+
+    @testset "three-state layout extends the two-state one" begin
+        for infer in (false, true)
+            l2 = M.ParamLayout(data.S, data.n_years, infer, M.PROC_RW1C)
+            l3 = M.ParamLayout(data.S, data.n_years, infer, M.PROC_RW1C,
+                               M.NO_SP_PIN, true)
+            # tau, rho and six multipliers go at the end
+            @test l3.n == l2.n + 8
+            @test (l3.i_tau, l3.i_rho) == (l2.n + 1, l2.n + 2)
+            @test l3.e_slot == ntuple(k -> l2.n + 2 + k, 6)
+            @test l3.sp_slot == l2.sp_slot
+            @test (l2.i_tau, l2.i_rho) == (0, 0)
+            @test l2.e_slot == ntuple(_ -> 0, 6)
+            @test M.param_names(l3)[end-7:end] ==
+                  vcat(["tau", "rho"], ["e_mult[$k]" for k in 1:6])
+            @test length(M.param_names(l3)) == l3.n
+            # pinned multipliers have no slot or name
+            lp = M.ParamLayout(data.S, data.n_years, infer, M.PROC_RW1C,
+                               M.NO_SP_PIN, true, (NaN, 0.5, 0.0, NaN, NaN, 1.0))
+            @test lp.n == l2.n + 5
+            @test lp.e_slot == (l2.n + 3, 0, 0, l2.n + 4, l2.n + 5, 0)
+            @test M.param_names(lp)[end-2:end] ==
+                  ["e_mult[1]", "e_mult[4]", "e_mult[5]"]
+            th = M.initial_theta(lp); th[lp.e_slot[4]] = 1.3
+            P = M.extract_params(th, lp)
+            @test P.em[[2, 3, 6]] == [0.5, 0.0, 1.0]
+            @test isapprox(P.em[4], M.logistic(1.3))
+        end
+    end
+
+    @testset "three states collapse to two when E and I emit alike" begin
+        # With every multiplier at 1, E and I emit the same, and E+I has the
+        # two-state transitions. So the likelihood should equal the two-state
+        # one whatever tau and rho are.
+        all_e = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+        se_pr, sp_pr = M.default_accuracy_priors(M.ACC_LOGITNORMAL)
+        for infer in (false, true)
+            l2 = M.ParamLayout(data.S, data.n_years, infer, M.PROC_RW1C)
+            l3 = M.ParamLayout(data.S, data.n_years, infer, M.PROC_RW1C,
+                               M.NO_SP_PIN, true, all_e)
+            th2 = M.initial_theta(l2) .+ 0.05 .* cos.(1:l2.n)
+            lp2 = M.logposterior(th2, data, l2, se_pr, sp_pr, true, M.EMPTY_YW, true)
+            p2 = M.decode(data, M.extract_params(th2, l2))
+            for (zt, zr) in ((-3.0, 0.0), (0.7, -1.2), (-6.0, 2.5))
+                th3 = vcat(th2, [zt, zr])
+                prior = M.accuracy_logpdf_z(M.SEI_TAU_PRIOR, zt, M.logistic(zt), true) +
+                        M.accuracy_logpdf_z(M.SEI_RHO_PRIOR, zr, M.logistic(zr), true)
+                lp3 = M.logposterior(th3, data, l3, se_pr, sp_pr, true, M.EMPTY_YW, true)
+                @test isapprox(lp3 - prior, lp2; atol = 1e-9)
+                # and P(E) + P(I) should be the two-state P(infected)
+                P3 = M.extract_params(th3, l3)
+                p_exp, p_ifs = M.decode_sei(data, P3)
+                @test maximum(abs.(p_exp .+ p_ifs .- p2)) < 1e-10
+                @test maximum(abs.(M.decode(data, P3) .- p2)) < 1e-10
+            end
+        end
+    end
+
+    @testset "exposed sensitivity is the infectious one times a multiplier" begin
+        # P(+ | E) = m Se. Check the factors at the first tested capture.
+        lay = M.ParamLayout(data.S, data.n_years, true, M.PROC_RW1C,
+                            M.NO_SP_PIN, true)
+        th = M.initial_theta(lay) .+ 0.2 .* sin.(1:lay.n)
+        P = M.extract_params(th, lay)
+        gj = findfirst(j -> data.ptr[j + 1] > data.ptr[j], 1:length(data.times))
+        bU, bE, bI = M.emission3(data, gj, P)
+        wantU = 1.0; wantE = 1.0; wantI = 1.0
+        for p in data.ptr[gj]:(data.ptr[gj + 1] - 1)
+            k = data.tidx[p]
+            pos = data.vals[p] == 1
+            wantU *= pos ? 1 - P.Sp[k] : P.Sp[k]
+            wantI *= pos ? P.Se[k] : 1 - P.Se[k]
+            wantE *= pos ? P.em[k] * P.Se[k] : 1 - P.em[k] * P.Se[k]
+        end
+        @test isapprox(bU, wantU; rtol = 1e-12)
+        @test isapprox(bI, wantI; rtol = 1e-12)
+        @test isapprox(bE, wantE; rtol = 1e-12)
+        @test all(m -> 0.0 < m < 1.0, P.em)
+        # m = 1 gives I's factor
+        l1 = M.ParamLayout(data.S, data.n_years, true, M.PROC_RW1C,
+                           M.NO_SP_PIN, true, (1.0, 1.0, 1.0, 1.0, 1.0, 1.0))
+        @test isapprox(M.emission3(data, gj, M.extract_params(th[1:l1.n], l1))[2],
+                       bI; rtol = 1e-12)
+        # m = 0: factor is 0 if the capture has any positive, else 1
+        l0 = M.ParamLayout(data.S, data.n_years, true, M.PROC_RW1C,
+                           M.NO_SP_PIN, true, (0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+        P0 = M.extract_params(th[1:l0.n], l0)
+        for j in 1:length(data.times)
+            data.ptr[j + 1] > data.ptr[j] || continue
+            anypos = any(p -> data.vals[p] == 1, data.ptr[j]:(data.ptr[j + 1] - 1))
+            @test M.emission3(data, j, P0)[2] == (anypos ? 0.0 : 1.0)
+        end
+        # flat prior on the multipliers
+        @test M.SEI_MULT_PRIOR.family == M.ACC_BETA
+        @test (M.SEI_MULT_PRIOR.p, M.SEI_MULT_PRIOR.q) == (1.0, 1.0)
+    end
+
+    @testset "the exposed state is ordered above uninfected" begin
+        # Penalty is -w * log1pexp(-(m Se + Sp - 1)/s) for each free
+        # multiplier, on top of the Se+Sp>1 term. Recover it as penalised
+        # minus unpenalised log posterior.
+        se_pr, sp_pr = M.default_accuracy_priors(M.ACC_LOGITNORMAL)
+        pen_of(lay, th) =
+            M.logposterior(th, data, lay, se_pr, sp_pr, true, M.EMPTY_YW, true) -
+            M.logposterior(th, data, lay, se_pr, sp_pr, false, M.EMPTY_YW, true)
+        term(d) = -M.PENALTY_WEIGHT * M.log1pexp(-d / M.PENALTY_SCALE)
+        for infer in (false, true)
+            lay = M.ParamLayout(data.S, data.n_years, infer, M.PROC_RW1C,
+                                M.NO_SP_PIN, true, (NaN, NaN, NaN, 0.0, 1.0, NaN))
+            th = M.initial_theta(lay) .+ 0.2 .* sin.(1:lay.n)
+            # push one multiplier low enough for its term to matter
+            th[lay.e_slot[3]] = -6.0
+            P = M.extract_params(th, lay)
+            want = sum(term(P.Se[k] + P.Sp[k] - 1.0) for k in 1:6) +
+                   sum(term(P.em[k] * P.Se[k] + P.Sp[k] - 1.0) for k in (1, 2, 3, 6))
+            @test isapprox(pen_of(lay, th), want; atol = 1e-9)
+            # assays 4 and 5 are pinned so they contribute nothing, even
+            # though m = 0 would be heavily penalised
+            @test term(0.0 * P.Se[4] + P.Sp[4] - 1.0) < -1.0
+            # culture term is large here and goes away with a higher multiplier
+            @test term(P.em[3] * P.Se[3] + P.Sp[3] - 1.0) < -1.0
+            th2 = copy(th); th2[lay.e_slot[3]] = 2.0
+            @test pen_of(lay, th2) > pen_of(lay, th) + 1.0
+            # gradient includes it, also with fixed Se/Sp
+            f = x -> M.logposterior(x, data, lay, se_pr, sp_pr, true, M.EMPTY_YW, true)
+            ga = zeros(lay.n); gf = zeros(lay.n)
+            M.logposterior_grad!(ga, th, data, lay, se_pr, sp_pr, true, M.EMPTY_YW, true)
+            M.gradient!(gf, f, th, Val(13))
+            @test maximum(abs.(ga .- gf)) < 1e-8
+            @test abs(ga[lay.e_slot[3]]) > 1.0
+        end
+    end
+
+    @testset "three-state smoother" begin
+        lay = M.ParamLayout(data.S, data.n_years, false, M.PROC_RW1C,
+                            M.NO_SP_PIN, true)
+        th = M.initial_theta(lay) .+ 0.05 .* sin.(1:lay.n)
+        th[lay.i_tau] = -1.0
+        P = M.extract_params(th, lay)
+        @test P.sei && isapprox(P.tau, M.logistic(-1.0))
+        p_exp, p_ifs = M.decode_sei(data, P)
+        @test all(x -> 0.0 <= x <= 1.0, p_exp)
+        @test all(x -> 0.0 <= x <= 1.0, p_ifs)
+        @test all(p_exp .+ p_ifs .<= 1.0 + 1e-12)
+        # P(infectious) and P(exposed or infectious) are non-decreasing within
+        # a badger. P(exposed) on its own can fall.
+        start = 1
+        for i in 1:data.n_ind
+            e = data.seq_ends[i]
+            for j in (start + 1):e
+                @test p_ifs[j] >= p_ifs[j - 1] - 1e-12
+                @test p_exp[j] + p_ifs[j] >= p_exp[j - 1] + p_ifs[j - 1] - 1e-12
+            end
+            start = e + 1
+        end
+        # brute-force the first badger's likelihood over all monotone paths
+        e1 = data.seq_ends[1]
+        n1 = e1
+        if n1 <= 12
+            tot = 0.0
+            pi1 = P.pi1_vec[data.entry_year[1]]
+            for a in 1:(n1 + 1), b in a:(n1 + 1)
+                # U before step a, E from a to b-1, I from b on
+                pr = 1.0
+                for j in 1:n1
+                    st = j < a ? 0 : (j < b ? 1 : 2)
+                    prev = j == 1 ? -1 : ((j - 1) < a ? 0 : ((j - 1) < b ? 1 : 2))
+                    if j == 1
+                        pr *= st == 0 ? 1 - pi1 : (st == 1 ? pi1 * (1 - P.rho) : pi1 * P.rho)
+                    else
+                        t = data.times[j]
+                        lam = M.clamp_prob(M.logistic(P.alpha[M.season_of(t, data.S)] +
+                                                      P.gamma[M.year_of(t, data.S)]))
+                        if prev == 0
+                            pr *= st == 0 ? 1 - lam : (st == 1 ? lam : 0.0)
+                        elseif prev == 1
+                            pr *= st == 1 ? 1 - P.tau : (st == 2 ? P.tau : 0.0)
+                        end
+                    end
+                    bU, bE, bI = M.emission3(data, j, P)
+                    pr *= st == 0 ? bU : (st == 1 ? bE : bI)
+                end
+                tot += pr
+            end
+            ll = M.seq_loglik_sei(data, 1, e1, pi1, P.rho, P.tau, P.alpha, P.gamma,
+                                  P.Se, P.Sp, P.em, data.S)
+            @test isapprox(log(tot), ll; atol = 1e-10)
+        end
+    end
+
+    @testset "sampled state paths follow the smoothed marginals" begin
+        # Share of sampled paths in each state at each step should match the
+        # forward-backward marginals, for both models.
+        for sei in (false, true)
+            lay = M.ParamLayout(data.S, data.n_years, false, M.PROC_RW1C,
+                                M.NO_SP_PIN, sei)
+            th = M.initial_theta(lay) .+ 0.05 .* sin.(1:lay.n)
+            sei && (th[lay.i_tau] = -1.0)
+            P = M.extract_params(th, lay)
+            p_inf, p_exp, p_ifs = M.decode_all(data, P)
+            @test isempty(p_exp) == !sei
+            nmax = length(data.times)
+            states = zeros(Int, nmax)
+            fU = zeros(nmax); fE = zeros(nmax); fI = zeros(nmax); lam = zeros(nmax)
+            rng = M.Rng(11)
+            nrep = 4000
+            worst = 0.0
+            start = 1
+            for i in 1:min(data.n_ind, 12)
+                e = data.seq_ends[i]
+                n = e - start + 1
+                c_any = zeros(n); c_ifs = zeros(n)
+                for _ in 1:nrep
+                    M.sample_path!(states, rng, fU, fE, fI, lam, data, start, e,
+                                   P.pi1_vec[data.entry_year[i]], P, data.S)
+                    # paths never go backwards
+                    @test issorted(view(states, 1:n))
+                    sei || @test all(s -> s != 1, view(states, 1:n))
+                    for j in 1:n
+                        c_any[j] += states[j] >= 1
+                        c_ifs[j] += states[j] == 2
+                    end
+                end
+                for j in 1:n
+                    worst = max(worst, abs(c_any[j] / nrep - p_inf[start + j - 1]))
+                    sei && (worst = max(worst, abs(c_ifs[j] / nrep - p_ifs[start + j - 1])))
+                end
+                start = e + 1
+            end
+            # 4000 draws, binomial sd <= 0.008, so 0.04 is 5 sd
+            @test worst < 0.04
+        end
+    end
+
+    @testset "three-state trajectory outputs" begin
+        lay = M.ParamLayout(data.S, data.n_years, false, M.PROC_RW1C,
+                            M.NO_SP_PIN, true)
+        se_pr, sp_pr = M.default_accuracy_priors(M.ACC_LOGITNORMAL)
+        gradf! = (g, x) -> M.logposterior_grad!(g, x, data, lay, se_pr, sp_pr, true,
+                                                M.EMPTY_YW, true)
+        res = M.nuts(gradf!, M.initial_theta(lay), 40, 60, 0.8, 5)
+        valid = Set(Float64.(data.times))
+        for sample in (false, true)
+            out = mktempdir()
+            opts = M.Options(DATA, "nuts", out, 4, fill(true, 6), false, true,
+                             :stack, 40, 60, 0.8, 5, 1000, M.PROC_RW1C, 8,
+                             "", "", "", -1.0, -1,
+                             M.ACC_LOGITNORMAL, false, M.NO_SP_PIN,
+                             true, M.NO_E_PIN, sample, 0.0, "", 1)
+            M.finish_draws(opts, data, lay, res.draws)
+            tj = M.read_matrix(joinpath(out, "trajectories.csv"))
+            @test size(tj) == (data.n_ind * 8, 4)
+            @test all(t -> t == 0.0 || t in valid, tj[:, 3])
+            @test all(t -> t == 0.0 || t in valid, tj[:, 4])
+            # infectious_time needs an infection_time, and can't precede it
+            for r in axes(tj, 1)
+                tj[r, 4] == 0.0 && continue
+                @test tj[r, 3] != 0.0
+                @test tj[r, 4] >= tj[r, 3]
+            end
+            pin = M.read_matrix(joinpath(out, "p_infected.csv"))
+            @test size(pin, 2) == 5
+            # 1e-6 because the CSV has ~8 significant figures
+            @test maximum(abs.(pin[:, 3] .- pin[:, 4] .- pin[:, 5])) < 1e-6
+            pv = M.read_matrix(joinpath(out, "prevalence.csv"))
+            @test size(pv, 2) == 4
+            @test all(r -> isnan(pv[r, 2]) || pv[r, 4] <= pv[r, 2] + 1e-12, axes(pv, 1))
+            pd = M.read_matrix(joinpath(out, "prevalence_infectious_draws.csv"))
+            @test size(pd, 2) == 9
+        end
+        # same seed, same trajectories
+        outs = [mktempdir(), mktempdir()]
+        for o in outs
+            opts = M.Options(DATA, "nuts", o, 4, fill(true, 6), false, true,
+                             :stack, 40, 60, 0.8, 5, 1000, M.PROC_RW1C, 8,
+                             "", "", "", -1.0, -1,
+                             M.ACC_LOGITNORMAL, false, M.NO_SP_PIN,
+                             true, M.NO_E_PIN, true, 0.0, "", 1)
+            M.draw_outputs(opts, data, lay, res.draws, 8)
+        end
+        @test read(joinpath(outs[1], "trajectories.csv")) ==
+              read(joinpath(outs[2], "trajectories.csv"))
+    end
+
+    @testset "draws.csv is on the scale its column names claim" begin
+        # draws.csv should hold sigma_g, Se, Sp, tau, rho, e_mult on the
+        # natural scale, not the log/logit values the sampler uses
+        lay = M.ParamLayout(data.S, data.n_years, true, M.PROC_RW1C,
+                            (NaN, NaN, 1.0, NaN, NaN, NaN), true)
+        draws = reshape(collect(range(-2.0, 2.0; length = 3 * lay.n)), lay.n, 3)
+        out = mktempdir()
+        opts = M.Options(DATA, "nuts", out, 4, fill(true, 6), true, true,
+                         :stack, 3, 3, 0.8, 1, 1000, M.PROC_RW1C, 0,
+                         "", "", "", -1.0, -1,
+                         M.ACC_LOGITNORMAL, false, (NaN, NaN, 1.0, NaN, NaN, NaN),
+                         true, M.NO_E_PIN, false, 0.0, "", 1)
+        M.write_draws(opts, lay, draws)
+        hdr = split(readline(joinpath(out, "draws.csv")), ",")
+        got = M.read_matrix(joinpath(out, "draws.csv"))
+        @test hdr == M.param_names(lay)
+        @test !("Sp[3]" in hdr)                       # pinned: not a parameter
+        for (j, nm) in enumerate(hdr), k in 1:3
+            x = draws[j, k]
+            want = nm == "sigma_g" ? exp(x) :
+                   (startswith(nm, "Se[") || startswith(nm, "Sp[") ||
+                    startswith(nm, "e_mult[") ||
+                    nm == "tau" || nm == "rho") ? M.logistic(x) : x
+            @test isapprox(got[k, j], want; rtol = 1e-6, atol = 1e-8)
+        end
+    end
+
+    @testset "badgers with a known birth start susceptible there" begin
+        # Every third badger gets a birth 4 timesteps before its first row.
+        # One gets a birth after its first row and one a birth at 0; both
+        # should be ignored.
+        ids = sort(unique(Int.(mat[:, 2])))
+        firstt = Dict(i => minimum(Int.(mat[mat[:, 2] .== i, 1])) for i in ids)
+        births = Dict{Int,Int}()
+        for (n, i) in enumerate(ids)
+            n % 3 == 0 && firstt[i] > 4 && (births[i] = firstt[i] - 4)
+        end
+        bad_after = first(i for i in ids if !haskey(births, i)); births[bad_after] = firstt[bad_after] + 1
+        bad_before = first(i for i in ids if !haskey(births, i)); births[bad_before] = 0
+        db = M.build_data(mat, fill(true, 6), :stack, 4, births)
+        @test db.n_ind == data.n_ind
+        @test !any(data.born)                       # no births given: nobody
+        n_ok = count(i -> get(births, i, 0) >= 1 && births[i] <= firstt[i], ids)
+        @test count(db.born) == n_ok
+        @test !db.born[findfirst(==(bad_after), db.ids)]
+        @test !db.born[findfirst(==(bad_before), db.ids)]
+        # four extra uncaptured, untested steps each
+        @test length(db.times) == length(data.times) + 4 * n_ok
+        @test length(db.vals) == length(data.vals)
+        start = 1
+        for i in 1:db.n_ind
+            e = db.seq_ends[i]
+            if db.born[i]
+                @test db.times[start] == births[db.ids[i]]
+                @test !any(db.captured[start:(start + 3)])
+                @test all(j -> db.ptr[j + 1] == db.ptr[j], start:(start + 3))
+            end
+            start = e + 1
+        end
+
+        se_pr, sp_pr = M.default_accuracy_priors(M.ACC_LOGITNORMAL)
+        for sei in (false, true), infer in (false, true)
+            lay = M.ParamLayout(db.S, db.n_years, infer, M.PROC_RW1C, M.NO_SP_PIN, sei)
+            th = M.initial_theta(lay) .+ 0.1 .* sin.(1:lay.n)
+            f = x -> M.logposterior(x, db, lay, se_pr, sp_pr, true, M.EMPTY_YW, true)
+            ga = zeros(lay.n); gf = zeros(lay.n)
+            la = M.logposterior_grad!(ga, th, db, lay, se_pr, sp_pr, true, M.EMPTY_YW, true)
+            lf = M.gradient!(gf, f, th, Val(13))
+            @test isapprox(la, lf; atol = 1e-8)
+            @test maximum(abs.(ga .- gf)) < 1e-9
+            # smoother gives 0 at birth whatever pi1_0 is
+            for z in (-1.7, 3.0)
+                th2 = copy(th); th2[lay.i_pi1_0] = z
+                p = M.decode(db, M.extract_params(th2, lay))
+                st = 1
+                for i in 1:db.n_ind
+                    db.born[i] && @test p[st] == 0.0
+                    st = db.seq_ends[i] + 1
+                end
+            end
+            # sampled paths start uninfected too
+            P = M.extract_params(th, lay)
+            nmax = length(db.times); states = zeros(Int, nmax)
+            fU = zeros(nmax); fE = zeros(nmax); fI = zeros(nmax); lam = zeros(nmax)
+            rng = M.Rng(3); st = 1
+            for i in 1:db.n_ind
+                e = db.seq_ends[i]
+                if db.born[i]
+                    for _ in 1:20
+                        M.sample_path!(states, rng, fU, fE, fI, lam, db, st, e,
+                                       M.entry_prob(db, P.pi1_vec, i), P, db.S)
+                        @test states[1] == 0
+                    end
+                end
+                st = e + 1
+            end
+        end
+        # if every badger has a birth, pi1 only appears in its priors
+        allb = Dict(i => firstt[i] for i in ids)
+        da = M.build_data(mat, fill(true, 6), :stack, 4, allb)
+        @test all(da.born)
+        lay = M.ParamLayout(da.S, da.n_years, false, M.PROC_RW1C, M.NO_SP_PIN, true)
+        th = M.initial_theta(lay); g = zeros(lay.n)
+        M.logposterior_grad!(g, th, da, lay, se_pr, sp_pr, true, M.EMPTY_YW, true)
+        @test isapprox(g[lay.i_pi1_0], -(th[lay.i_pi1_0] + 1.7); atol = 1e-12)
+        @test isapprox(g[lay.i_pi1_mult], -(th[lay.i_pi1_mult] - 1.0); atol = 1e-12)
+
+        # read_births round trip; empty birth = unknown
+        path = joinpath(mktempdir(), "birth.csv")
+        open(path, "w") do io
+            println(io, "id,birth")
+            for (n, i) in enumerate(ids)
+                println(io, i, ",", haskey(births, i) ? string(births[i]) : "")
+            end
+        end
+        @test M.read_births(path) == births
+    end
+
+    @testset "start-point jitter" begin
+        lay = M.ParamLayout(data.S, data.n_years, true, M.PROC_RW1C,
+                            M.NO_SP_PIN, true)
+        mk(seed, sd) = M.Options(DATA, "nuts", ".", 4, fill(true, 6), true, true,
+                                 :stack, 3, 3, 0.8, seed, 1000, M.PROC_RW1C, 0,
+                                 "", "", "", -1.0, -1,
+                                 M.ACC_LOGITNORMAL, false, M.NO_SP_PIN,
+                                 true, M.NO_E_PIN, false, sd, "", 1)
+        base = M.initial_theta(lay)
+        # off by default
+        @test M.start_theta(mk(1, 0.0), lay) == base
+        a = M.start_theta(mk(1, 1.0), lay)
+        # same for a given seed, different between seeds
+        @test a == M.start_theta(mk(1, 1.0), lay)
+        @test a != M.start_theta(mk(2, 1.0), lay)
+        @test all(a .!= base)
+        @test isapprox(M.start_theta(mk(1, 0.5), lay) .- base, 0.5 .* (a .- base))
+    end
+
+    @testset "multi-start initialisation" begin
+        # Toy objective with two optima in the first coordinate: -2 (height 0)
+        # and +3 (height 2). The basins meet at 0.1, so the default start at 0
+        # finds the lower one.
+        lay = M.ParamLayout(data.S, data.n_years, false, M.PROC_RW1C)
+        mk(seed, n) = M.Options(DATA, "map", ".", 4, fill(true, 6), false, true,
+                                :stack, 3, 3, 0.8, seed, 1000, M.PROC_RW1C, 0,
+                                "", "", "", -1.0, -1,
+                                M.ACC_LOGITNORMAL, false, M.NO_SP_PIN,
+                                false, M.NO_E_PIN, false, 0.0, "", n)
+        base = M.initial_theta(lay)
+        ca = zeros(lay.n); ca[1] = -2.0
+        cb = zeros(lay.n); cb[1] = 3.0
+        negf! = (g, x) -> begin
+            z = x .- base
+            a = -0.5 * sum(abs2, z .- ca); b = 2.0 - 0.5 * sum(abs2, z .- cb)
+            # log(exp(a) + exp(b)), and its gradient
+            m = max(a, b); lse = m + log(exp(a - m) + exp(b - m))
+            wa = exp(a - lse); wb = exp(b - lse)
+            g .= wa .* (z .- ca) .+ wb .* (z .- cb)
+            return -lse
+        end
+        one_ = M.best_start(mk(1, 1), lay, negf!, 200)
+        many = M.best_start(mk(1, 12), lay, negf!, 200)
+        @test one_.theta[1] - base[1] < 0.0              # the lower optimum
+        @test many.theta[1] - base[1] > 2.5              # the higher one
+        @test many.logp > one_.logp + 1.5
+        # doesn't depend on the seed
+        @test M.best_start(mk(7, 12), lay, negf!, 200).theta == many.theta
+        # one start = previous behaviour
+        @test one_.theta == M.lbfgs(negf!, M.initial_theta(lay); maxiter = 200).theta
     end
 
     @testset "RNG" begin

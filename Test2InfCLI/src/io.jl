@@ -92,8 +92,28 @@ and masked-out assays are skipped.
   :pool  -- captures merged per timestep, positive if any was positive
   :last  -- keep only the final capture in each timestep
 """
+const NO_BIRTHS = Dict{Int,Int}()
+
+"""
+    read_births(path) -> Dict{Int,Int}
+
+Birth timesteps from a CSV with header `id,birth`, on the same timestep grid as
+the data. Missing or empty = unknown.
+"""
+function read_births(path::String)
+    m = read_matrix(path)
+    size(m, 2) >= 2 || error("--birth expects two columns, id and birth: " * path)
+    out = Dict{Int,Int}()
+    for r in axes(m, 1)
+        (isnan(m[r, 1]) || isnan(m[r, 2])) && continue
+        out[Int(m[r, 1])] = Int(m[r, 2])
+    end
+    return out
+end
+
 function build_data(mat::Matrix{Float64}, test_mask::Vector{Bool},
-                    repeat_captures::Symbol, S::Int)
+                    repeat_captures::Symbol, S::Int,
+                    births::Dict{Int,Int} = NO_BIRTHS)
     nrow = size(mat, 1)
     size(mat, 2) >= 3 + N_TESTS || error("expected at least $(3 + N_TESTS) columns")
 
@@ -125,6 +145,7 @@ function build_data(mat::Matrix{Float64}, test_mask::Vector{Bool},
     entry_year = Int[]
     ids = Int[]
     captured = Bool[]
+    born = Bool[]
 
     for k in 1:n_ind
         rowsk = per_ind[k]
@@ -146,6 +167,16 @@ function build_data(mat::Matrix{Float64}, test_mask::Vector{Bool},
             t < first_t && (first_t = t)
             t > last_t && (last_t = t)
         end
+        # If the birth timestep is known, start the grid there. The steps up
+        # to first capture are uncaptured filler (no emission, one hazard
+        # each) and the badger starts susceptible. Births before timestep 1 or
+        # after the first capture are ignored.
+        has_birth = false
+        b = get(births, uids[k], 0)
+        if b >= 1 && b <= first_t
+            has_birth = true
+            first_t = b
+        end
         tsteps = Int[]
         for t in first_t:last_t
             push!(tsteps, t)
@@ -153,6 +184,7 @@ function build_data(mat::Matrix{Float64}, test_mask::Vector{Bool},
 
         push!(entry_year, year_of(first_t, S))
         push!(ids, uids[k])
+        push!(born, has_birth)
 
         for t in tsteps
             # Which raw rows fall in this timestep?
@@ -212,7 +244,7 @@ function build_data(mat::Matrix{Float64}, test_mask::Vector{Bool},
 
     n_years = isempty(times) ? 1 : maximum(year_of(t, S) for t in times)
     return HMMData(length(seq_ends), S, n_years, seq_ends, entry_year,
-                   times, ptr, vals, tidx, ids, captured)
+                   times, ptr, vals, tidx, ids, captured, born)
 end
 
 """
